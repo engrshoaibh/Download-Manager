@@ -46,7 +46,7 @@ impl DownloadManager {
             .unwrap_or(DEFAULT_SEGMENT_COUNT)
             .min(MAX_SEGMENT_COUNT);
 
-        let filename = url
+        let mut filename = url
             .split('/')
             .last()
             .and_then(|s| s.split('?').next())
@@ -54,10 +54,26 @@ impl DownloadManager {
             .unwrap_or("download")
             .to_string();
 
-        let save_path = PathBuf::from(&save_dir)
-            .join(&filename)
-            .to_string_lossy()
-            .to_string();
+        let save_dir = PathBuf::from(&save_dir);
+        let mut save_path = save_dir.join(&filename);
+        if save_path.exists() {
+            let path = std::path::Path::new(&filename);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&filename);
+            let ext = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+            
+            let mut counter = 1;
+            loop {
+                let new_name = format!("{} ({}){}", stem, counter, ext);
+                save_path = save_dir.join(&new_name);
+                if !save_path.exists() {
+                    filename = new_name;
+                    break;
+                }
+                counter += 1;
+            }
+        }
+
+        let save_path = save_path.to_string_lossy().to_string();
 
         let job = DownloadJob::new(url.clone(), filename, save_path.clone(), segs);
         let job_id = job.id;
