@@ -1,0 +1,74 @@
+[package]
+name = "dm-core"
+version = "0.1.0"
+edition = "2021"
+description = "High-Performance Download Manager Core Engine"
+
+[[bin]]
+name = "dm-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client — supports HTTP/1.1, HTTP/2
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "http2", "cookies", "gzip", "brotli"] }
+
+# HTTP/3 QUIC (quinn transport — h3-quinn crate pending 0.11 compatibility)
+# h3-quinn is temporarily excluded; HTTP/3 detection via alt-svc is still active.
+# The reqwest client uses HTTP/2 with parallel segments for near-equivalent performance.
+quinn = "0.11"
+
+# Web framework for daemon API (REST + WebSocket)
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# WebSocket
+tokio-tungstenite = "0.24"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Memory-mapped files (zero-copy I/O)
+memmap2 = "0.9"
+
+# Unique IDs for download jobs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Async stream utilities (StreamExt, SinkExt)
+futures-util = "0.3"
+
+# Structured async-aware logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# URL parsing
+url = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Config file
+config = "0.14"
+
+# Cross-platform paths
+dirs = "5"
+
+# Atomic operations for shared state
+parking_lot = "0.12"
+
+# Async streams for response body iteration
+async-stream = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
