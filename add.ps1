@@ -1,1 +1,1 @@
-Invoke-RestMethod -Uri "http://127.0.0.1:7373/downloads" -Method POST -Body '{"url":"https://drive.usercontent.google.com/download?id=0B1MVW1mFO2zmZHVRWEQ3Rkc3SVE&export=download&authuser=0&resourcekey=0-u7mAvVbthYAG-_oxzMKz3Q&confirm=t&uuid=7266d81f-c46e-43d9-8d88-b6f3302caa14&at=AMrWOn1e4K_5lsEYh8BHmo2rYbHK%3A1788959262981"}' -ContentType "application/json"
+Invoke-RestMethod -Uri "http://127.0.0.1:7373/downloads" -Method POST -Body '{"url":"http://ipv4.download.thinkbroadband.com/10MB.zip"}' -ContentType "application/json"

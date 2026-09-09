@@ -43,7 +43,7 @@ impl HttpClient {
     ) -> Result<ServerInfo> {
         let ua = user_agent.unwrap_or(DEFAULT_UA);
 
-        let mut req = self.inner.get(url).header("User-Agent", ua).header("Range", "bytes=0-0");
+        let mut req = self.inner.head(url).header("User-Agent", ua);
 
         if let Some(c) = cookies {
             req = req.header("Cookie", c);
