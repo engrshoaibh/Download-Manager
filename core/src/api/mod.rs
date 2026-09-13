@@ -1,4 +1,7 @@
+pub mod error;
+pub mod events;
 pub mod routes;
+pub mod ws;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,9 +23,15 @@ pub async fn serve(manager: SharedManager) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route("/settings", get(routes::get_settings))
+        .route("/settings", axum::routing::put(routes::put_settings))
         .route("/downloads", get(routes::list_downloads))
         .route("/downloads", post(routes::add_download))
         .route("/downloads/:id", delete(routes::cancel_download))
+        .route("/downloads/:id/pause", post(routes::pause_download))
+        .route("/downloads/:id/resume", post(routes::resume_download))
+        .route("/youtube/probe", post(routes::youtube_probe))
+        .route("/dialog/folder", get(routes::select_folder))
         .route("/ws", get(routes::ws_handler))
         .layer(cors)
         .with_state(manager);

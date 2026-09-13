@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Download File</title>
+  <link rel="stylesheet" href="capture.css" />
+</head>
+<body>
+  <header class="bar">
+    <img src="../icons/icon48.png" alt="" width="28" height="28" />
+    <div>
+      <h1>Download File</h1>
+      <p class="sub">Send to Download Manager</p>
+    </div>
+  </header>
+
+  <main>
+    <label class="field">
+      <span>Address</span>
+      <input id="url" type="text" readonly />
+    </label>
+
+    <label class="field">
+      <span>File name</span>
+      <input id="filename" type="text" readonly />
+    </label>
+
+    <div class="row">
+      <label class="field grow">
+        <span>Segments</span>
+        <input id="segments" type="number" min="1" max="64" value="16" />
+      </label>
+      <label class="field grow">
+        <span>Save folder (optional)</span>
+        <div style="display: flex; gap: 4px;">
+          <input id="saveDir" type="text" placeholder="Default Downloads" style="flex: 1;" />
+          <button type="button" id="btnBrowse" class="btn ghost" style="padding: 4px 8px; margin: 0; min-height: 100%; border: 1px solid var(--border);">📁</button>
+        </div>
+      </label>
+    </div>
+
+    <p id="status" class="status" hidden></p>
+  </main>
+
+  <footer>
+    <button type="button" id="btnBrowser" class="btn ghost">Download with browser</button>
+    <div class="spacer"></div>
+    <button type="button" id="btnCancel" class="btn ghost">Cancel</button>
+    <button type="button" id="btnStart" class="btn primary">Start download</button>
+  </footer>
+
+  <script type="module" src="capture.js"></script>
+</body>
+</html>

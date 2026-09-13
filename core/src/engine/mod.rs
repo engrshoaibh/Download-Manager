@@ -6,6 +6,8 @@ pub mod manager;
 pub mod scheduler;
 pub mod segment;
 pub mod worker;
+pub mod chunked;
+pub mod native_payload;
 
 /// Unique identifier for a download job
 pub type JobId = Uuid;
@@ -19,7 +21,7 @@ pub enum DownloadStatus {
     Downloading,
     Paused,
     Completed,
-    Failed(String),
+    Failed,
     Cancelled,
 }
 
@@ -65,6 +67,26 @@ pub struct DownloadJob {
     pub supports_ranges: bool,
     pub segment_count: usize,
     pub use_http3: bool,
+    /// Optional request headers kept so Resume works after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    /// YouTube quality hint: "best", "1080", "720", "audio", …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    /// Raw yt-dlp `-f` format selector (overrides quality when set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// `http` (segmented) or `youtube` (yt-dlp + FFmpeg).
+    #[serde(default = "default_engine")]
+    pub engine: String,
+}
+
+fn default_engine() -> String {
+    "http".into()
 }
 
 impl DownloadJob {
@@ -85,6 +107,12 @@ impl DownloadJob {
             supports_ranges: false,
             segment_count,
             use_http3: false,
+            user_agent: None,
+            cookies: None,
+            referer: None,
+            quality: None,
+            format: None,
+            engine: "http".into(),
         }
     }
 

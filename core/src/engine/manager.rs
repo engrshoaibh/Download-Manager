@@ -1,219 +1,1448 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info};
+use anyhow::{bail, Context, Result};
+use tokio::sync::RwLock;
+use tokio::task::JoinSet;
+use tracing::{info, warn};
 
+use super::scheduler::{StealState, MIN_STEAL_BYTES};
 use super::{DownloadJob, DownloadStatus, DmEvent, JobId, Segment};
-use crate::io::sparse::SparseFile;
+use crate::api::events::EventPublisher;
+use crate::io::sparse::{
+    part_data_path, remove_part_artifacts, resolve_partial_path, write_part_meta_atomic,
+    PartMetadata, SharedMmap, SparseFile,
+};
 use crate::network::client::HttpClient;
+use crate::persist;
+use crate::settings::{BandwidthLimiter, DaemonSettings};
 
-const DEFAULT_SEGMENT_COUNT: usize = 16;
+/// Adaptive scaler starts here and grows while throughput keeps rising.
+const INITIAL_SEGMENT_COUNT: usize = 4;
+const DEFAULT_SEGMENT_COUNT: usize = 32;
 const MAX_SEGMENT_COUNT: usize = 32;
+const MIN_SEGMENT_BYTES: u64 = 256 * 1024;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+/// Keep adding connections while marginal throughput gain exceeds this ratio.
+const ADAPTIVE_GAIN_THRESHOLD: f64 = 0.10;
 
-/// Manages all active and queued download jobs
+pub struct JobSignal {
+    pub stop: Arc<AtomicBool>,
+    pub cancel: Arc<AtomicBool>,
+    pub delete_file: Arc<AtomicBool>,
+}
+
+impl JobSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            delete_file: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
 pub struct DownloadManager {
     pub jobs: HashMap<JobId, DownloadJob>,
-    pub event_tx: broadcast::Sender<DmEvent>,
+    pub events: EventPublisher,
     pub http_client: Arc<HttpClient>,
+    pub settings: DaemonSettings,
+    pub bandwidth: Arc<BandwidthLimiter>,
+    signals: HashMap<JobId, Arc<JobSignal>>,
 }
 
 impl DownloadManager {
     pub fn new() -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        let settings = crate::settings::load_settings();
+        let bandwidth = BandwidthLimiter::new(&settings);
         Self {
             jobs: HashMap::new(),
-            event_tx,
+            events: EventPublisher::new(),
             http_client: Arc::new(HttpClient::new()),
+            settings,
+            bandwidth,
+            signals: HashMap::new(),
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<DmEvent> {
-        self.event_tx.subscribe()
+    pub fn update_settings(&mut self, settings: DaemonSettings) -> Result<()> {
+        crate::settings::save_settings(&settings)?;
+        self.bandwidth.apply(&settings);
+        self.settings = settings;
+        Ok(())
     }
 
-    /// Add a new download job to the queue and return it
+    /// Load persisted jobs (paused unfinished / completed history) or start empty.
+    pub fn load_or_new() -> Self {
+        let mut mgr = Self::new();
+        match persist::load_jobs() {
+            Ok(mut jobs) => {
+                if let Err(e) = persist::apply_orphan_sweep(&mut jobs, &mgr.settings) {
+                    warn!("Orphan .part sweep failed: {e:#}");
+                }
+                for job in jobs {
+                    let id = job.id;
+                    mgr.signals.insert(id, JobSignal::new());
+                    mgr.jobs.insert(id, job);
+                }
+            }
+            Err(e) => warn!("Could not restore download list: {e:#}"),
+        }
+        mgr
+    }
+
+    pub(crate) fn persist(&mut self) {
+        let jobs: Vec<DownloadJob> = self.jobs.values().cloned().collect();
+        match persist::save_jobs(&jobs, &self.settings) {
+            Ok(saved) => {
+                let keep: std::collections::HashSet<_> =
+                    saved.iter().map(|j| j.id).collect();
+                self.jobs.retain(|id, _| keep.contains(id));
+            }
+            Err(e) => warn!("Failed to save download list: {e:#}"),
+        }
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::api::events::WsMessage> {
+        self.events.subscribe()
+    }
+
     pub fn add_download(
         &mut self,
         url: String,
         save_dir: String,
         segment_count: Option<usize>,
+        user_agent: Option<String>,
+        cookies: Option<String>,
+        referer: Option<String>,
+        filename_override: Option<String>,
+        title: Option<String>,
+        total_bytes_hint: Option<u64>,
+        quality: Option<String>,
+        format: Option<String>,
     ) -> Result<DownloadJob> {
         let url = url.trim().to_string();
         let segs = segment_count
             .unwrap_or(DEFAULT_SEGMENT_COUNT)
             .min(MAX_SEGMENT_COUNT);
 
-        let mut filename = url
-            .split('/')
-            .last()
-            .and_then(|s| s.split('?').next())
+        let is_direct_cdn = crate::network::client::is_googlevideo_media_url(&url);
+        let force_yt = !is_direct_cdn
+            && (quality
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+                || format
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false));
+        let yt_target = if is_direct_cdn {
+            /* Signed CDN stream — IDM-style segmented HTTP download */
+            None
+        } else if crate::youtube::is_youtube_page_url(&url) {
+            Some(crate::youtube::normalize_watch_url(&url))
+        } else if force_yt {
+            crate::youtube::resolve_youtube_target(&url, referer.as_deref())
+        } else {
+            None
+        };
+        let engine = if yt_target.is_some() {
+            "youtube"
+        } else {
+            "http"
+        };
+
+        let ext = if quality
+            .as_deref()
+            .map(|q| q.eq_ignore_ascii_case("audio"))
+            .unwrap_or(false)
+        {
+            "m4a"
+        } else if engine == "youtube" || is_direct_cdn {
+            "mp4"
+        } else {
+            ""
+        };
+
+        let filename = filename_override
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or("download")
-            .to_string();
+            .or_else(|| {
+                let t = title
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(sanitize_yt_name)
+                    .filter(|s| !s.is_empty())?;
+                let q = quality
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("best"));
+                let name = if let Some(q) = q {
+                    format!("{t} [{q}].{ext}")
+                } else if !ext.is_empty() {
+                    format!("{t}.{ext}")
+                } else {
+                    t
+                };
+                Some(name)
+            })
+            .or_else(|| {
+                if engine == "youtube" {
+                    Some("YouTube video.mp4".into())
+                } else {
+                    crate::network::client::filename_hint_from_url(&url)
+                }
+            })
+            .unwrap_or_else(|| {
+                url.split('/')
+                    .last()
+                    .and_then(|s| s.split('?').next())
+                    .filter(|s| !s.is_empty() && *s != "videoplayback")
+                    .unwrap_or("download")
+                    .to_string()
+            });
 
         let save_dir = PathBuf::from(&save_dir);
-        let mut save_path = save_dir.join(&filename);
-        if save_path.exists() {
-            let path = std::path::Path::new(&filename);
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&filename);
-            let ext = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
-            
-            let mut counter = 1;
-            loop {
-                let new_name = format!("{} ({}){}", stem, counter, ext);
-                save_path = save_dir.join(&new_name);
-                if !save_path.exists() {
-                    filename = new_name;
-                    break;
-                }
-                counter += 1;
+        let (filename, save_path) = unique_save_path(&save_dir, &filename);
+        let mut job = DownloadJob::new(url, filename, save_path, segs);
+        job.user_agent = user_agent;
+        job.cookies = cookies;
+        job.referer = referer;
+        job.quality = quality;
+        job.format = format;
+        job.engine = engine.into();
+        if let Some(n) = total_bytes_hint.filter(|&n| n > 0) {
+            job.total_bytes = n;
+        } else {
+            let clen = crate::network::client::content_length_from_url(&job.url);
+            if clen > 0 {
+                job.total_bytes = clen;
             }
         }
-
-        let save_path = save_path.to_string_lossy().to_string();
-
-        let job = DownloadJob::new(url.clone(), filename, save_path.clone(), segs);
+        // Prefer the canonical watch URL so resume/reprobe stay stable.
+        if let Some(target) = yt_target {
+            job.url = target;
+        }
         let job_id = job.id;
+        self.signals.insert(job_id, JobSignal::new());
 
-        // Broadcast job added
-        let _ = self.event_tx.send(DmEvent::JobAdded { job: job.clone() });
-
+        self.events.send(DmEvent::JobAdded { job: job.clone() });
         self.jobs.insert(job_id, job.clone());
+        self.persist();
 
         Ok(job)
     }
 
-    /// Cancel a job
-    pub fn cancel(&mut self, id: &JobId) -> bool {
+    pub fn pause(&mut self, id: &JobId) -> bool {
+        if let Some(sig) = self.signals.get(id) {
+            sig.stop.store(true, Ordering::Release);
+        }
         if let Some(job) = self.jobs.get_mut(id) {
-            job.status = DownloadStatus::Cancelled;
-            let _ = self.event_tx.send(DmEvent::JobUpdated { job: job.clone() });
+            if !matches!(
+                job.status,
+                DownloadStatus::Downloading | DownloadStatus::Probing | DownloadStatus::Queued
+            ) {
+                return false;
+            }
+            job.status = DownloadStatus::Paused;
+            job.speed_bps = 0.0;
+            self.events.send(DmEvent::JobUpdated { job: job.clone() });
+            self.persist();
             true
         } else {
             false
         }
     }
 
-    /// Core download execution — runs in a spawned task
+    pub fn cancel(&mut self, id: &JobId, delete_file: bool) -> bool {
+        let Some(job) = self.jobs.get(id).cloned() else {
+            return false;
+        };
+
+        if let Some(sig) = self.signals.get(id) {
+            sig.stop.store(true, Ordering::Release);
+            sig.cancel.store(true, Ordering::Release);
+            if delete_file {
+                sig.delete_file.store(true, Ordering::Release);
+            }
+        }
+
+        let active = matches!(
+            job.status,
+            DownloadStatus::Downloading | DownloadStatus::Probing | DownloadStatus::Queued
+        );
+
+        // For active downloads, workers still hold the mmap — delete .part in finalize_stop.
+        if !active && job.status != DownloadStatus::Completed {
+            crate::io::sparse::remove_part_artifacts(&job.save_path);
+            if job.engine == "youtube" {
+                let save_dir = std::path::PathBuf::from(&job.save_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                crate::youtube::cleanup_yt_temp(&save_dir, job.id);
+            }
+        }
+
+        if delete_file {
+            let path = std::path::PathBuf::from(&job.save_path);
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            // Also clean up any partial artifacts
+            crate::io::sparse::remove_part_artifacts(&job.save_path);
+            if job.engine == "youtube" {
+                let save_dir = std::path::PathBuf::from(&job.save_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                crate::youtube::cleanup_yt_temp(&save_dir, job.id);
+            }
+        }
+
+        self.jobs.remove(id);
+        self.signals.remove(id);
+        self.events.send(DmEvent::JobRemoved { id: *id });
+        self.persist();
+        true
+    }
+
+    pub fn remove_completed(&mut self, id: &JobId) -> bool {
+        self.cancel(id, false)
+    }
+
+    pub fn begin_resume(&mut self, id: &JobId) -> Result<DownloadJob> {
+        let job = self
+            .jobs
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Job not found"))?;
+        if !matches!(job.status, DownloadStatus::Paused | DownloadStatus::Failed) {
+            bail!("Download is not paused");
+        }
+        let sig = self.signals.entry(*id).or_insert_with(JobSignal::new);
+        sig.stop.store(false, Ordering::Release);
+        sig.cancel.store(false, Ordering::Release);
+        job.status = DownloadStatus::Queued;
+        job.speed_bps = 0.0;
+        let snapshot = job.clone();
+        self.events
+            .send(DmEvent::JobUpdated { job: snapshot.clone() });
+        self.persist();
+        Ok(snapshot)
+    }
+
     pub async fn run_download(
         mgr: Arc<RwLock<Self>>,
         mut job: DownloadJob,
         client: Arc<HttpClient>,
         user_agent: Option<String>,
         cookies: Option<String>,
+        referer: Option<String>,
     ) -> Result<()> {
         let job_id = job.id;
-        let tx = { mgr.read().await.event_tx.clone() };
+        let tx = { mgr.read().await.events.clone() };
+        let signal = {
+            let m = mgr.read().await;
+            m.signals
+                .get(&job_id)
+                .cloned()
+                .unwrap_or_else(JobSignal::new)
+        };
 
-        // Helper closure to update central state and broadcast
+        // Prefer headers stored on the job (needed after restart).
+        let user_agent = user_agent.or_else(|| job.user_agent.clone());
+        let cookies = cookies.or_else(|| job.cookies.clone());
+        let referer = referer.or_else(|| job.referer.clone());
+        if job.user_agent.is_none() && user_agent.is_some() {
+            job.user_agent = user_agent.clone();
+        }
+        if job.cookies.is_none() && cookies.is_some() {
+            job.cookies = cookies.clone();
+        }
+        if job.referer.is_none() && referer.is_some() {
+            job.referer = referer.clone();
+        }
+
+        let resuming = !job.segments.is_empty()
+            && job.total_bytes > 0
+            && (job.segments.iter().any(|s| s.downloaded > 0)
+                || crate::io::sparse::resolve_partial_path(&job.save_path).is_some());
+
         let update_state = |mgr: Arc<RwLock<Self>>, updated_job: DownloadJob| async move {
             let mut m = mgr.write().await;
             if let Some(j) = m.jobs.get_mut(&updated_job.id) {
+                if j.status == DownloadStatus::Cancelled {
+                    return;
+                }
+                if j.status == DownloadStatus::Paused
+                    && !matches!(
+                        updated_job.status,
+                        DownloadStatus::Paused | DownloadStatus::Completed | DownloadStatus::Failed
+                    )
+                {
+                    return;
+                }
                 *j = updated_job.clone();
-                let _ = m.event_tx.send(DmEvent::JobUpdated { job: updated_job });
+                m.events.send(DmEvent::JobUpdated { job: updated_job });
+                m.persist();
             }
         };
 
-        // Step 1: Probe server capabilities
-        job.status = DownloadStatus::Probing;
-        update_state(mgr.clone(), job.clone()).await;
+        // ── YouTube / yt-dlp path ──────────────────────────────────────
+        if job.engine == "youtube" {
+            return Self::run_youtube_download(
+                mgr,
+                job,
+                signal,
+                user_agent,
+                cookies,
+                referer,
+            )
+            .await;
+        }
 
-        let info = client
-            .probe(&job.url, user_agent.as_deref(), cookies.as_deref())
-            .await
-            .context("Failed to probe download URL")?;
+        if !resuming {
+            if job.total_bytes > 0 {
+                job.status = DownloadStatus::Downloading;
+                job.supports_ranges = true; // Assume true if size is provided
+                update_state(mgr.clone(), job.clone()).await;
+            } else {
+                job.status = DownloadStatus::Probing;
+                update_state(mgr.clone(), job.clone()).await;
 
-        job.total_bytes = info.content_length;
-        job.supports_ranges = info.supports_ranges;
-        job.use_http3 = info.supports_http3;
+                let info = client
+                    .probe(
+                        &job.url,
+                        user_agent.as_deref(),
+                        cookies.as_deref(),
+                        referer.as_deref(),
+                    )
+                    .await
+                    .context("Failed to probe download URL")?;
 
-        // Step 2: Pre-allocate sparse file on disk using a temporary extension (if size is known)
-        let tmp_path = format!("{}.tmp", job.save_path);
-        
+                if signal.stop.load(Ordering::Relaxed) {
+                    return Self::finalize_stop(mgr, job, None, &signal, "").await;
+                }
+
+                job.total_bytes = info.content_length;
+                job.supports_ranges = info.supports_ranges;
+                job.use_http3 = info.supports_http3;
+                // Prefer the post-redirect URL so workers skip re-following with Range.
+                if let Some(final_url) = info.final_url {
+                    if !final_url.is_empty() && final_url != job.url {
+                        job.url = final_url;
+                    }
+                }
+
+                if let Some(hint) = info.filename_hint {
+                    if !hint.is_empty()
+                        && (job.filename == "download"
+                            || job.filename == "videoplayback"
+                            || !job.filename.contains('.'))
+                    {
+                        let parent = PathBuf::from(&job.save_path)
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        let (name, path) = unique_save_path(&parent, &hint);
+                        job.filename = name;
+                        job.save_path = path;
+                    }
+                }
+
+                // Prefer clen embedded in googlevideo URLs when probe length is missing.
+                if job.total_bytes == 0 {
+                    let clen = crate::network::client::content_length_from_url(&job.url);
+                    if clen > 0 {
+                        job.total_bytes = clen;
+                        if is_googlevideo_url(&job.url) {
+                            job.supports_ranges = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let tmp_path = resolve_partial_path(&job.save_path)
+            .unwrap_or_else(|| part_data_path(&job.save_path))
+            .to_string_lossy()
+            .to_string();
+
+        // Migrate legacy `.tmp` → `.part` so meta and sweep use one naming scheme.
+        let canonical_part = part_data_path(&job.save_path);
+        if PathBuf::from(&tmp_path) != canonical_part && PathBuf::from(&tmp_path).exists() {
+            if let Err(e) = std::fs::rename(&tmp_path, &canonical_part) {
+                warn!("Could not migrate {} → {}: {e}", tmp_path, canonical_part.display());
+            }
+        }
+        let tmp_path = canonical_part.to_string_lossy().to_string();
+
         let mmap = if job.total_bytes > 0 {
-            let sparse = SparseFile::create(&tmp_path, job.total_bytes)
-                .context("Failed to pre-allocate disk space")?;
-            Some(Arc::new(std::sync::Mutex::new(sparse.into_mmap()?)))
+            let sparse = if resuming && std::path::Path::new(&tmp_path).exists() {
+                SparseFile::open(&tmp_path, job.total_bytes)
+                    .context("Failed to reopen paused download")?
+            } else {
+                SparseFile::create(&tmp_path, job.total_bytes)
+                    .context("Failed to pre-allocate disk space")?
+            };
+            Some(sparse.into_mmap()?)
         } else {
             None
         };
 
-        // Step 3: Decide segmentation strategy
-        let actual_segs = if job.supports_ranges && job.total_bytes > 0 {
-            job.segment_count
-        } else {
-            1 // Server doesn't support range — single stream fallback
-        };
+        if !resuming {
+            // Adaptive: start small; the 2s scaler grows toward job.segment_count / 32.
+            let max_segs = if job.supports_ranges && job.total_bytes > 0 {
+                let max_by_size = (job.total_bytes / MIN_SEGMENT_BYTES).max(1) as usize;
+                job.segment_count
+                    .min(MAX_SEGMENT_COUNT)
+                    .min(max_by_size)
+                    .max(1)
+            } else {
+                1
+            };
+            let initial = if max_segs > 1 {
+                INITIAL_SEGMENT_COUNT.min(max_segs)
+            } else {
+                1
+            };
+            job.segment_count = max_segs;
+            job.segments = divide_into_segments(job.total_bytes, initial);
+        }
 
-        // Divide file into initial segments
-        job.segments = divide_into_segments(job.total_bytes, actual_segs);
+        {
+            let meta = PartMetadata::from_job(&job, job.segments.clone());
+            if let Err(e) = write_part_meta_atomic(&meta) {
+                warn!("Failed to write initial .part.meta: {e:#}");
+            }
+        }
+
         job.status = DownloadStatus::Downloading;
         update_state(mgr.clone(), job.clone()).await;
 
-        info!("Starting download: {} | {} segments | HTTP3={}", job.filename, actual_segs, job.use_http3);
+        info!(
+            "{} download: {} | {} initial segments (max {}) | HTTP3={}",
+            if resuming { "Resuming" } else { "Starting" },
+            job.filename,
+            job.segments.len(),
+            job.segment_count,
+            job.use_http3
+        );
 
-        // Step 4: Spawn segment workers
+        // Always track live segment state so we can checkpoint to disk.
+        let steal = Arc::new(parking_lot::Mutex::new(StealState::from_segments(
+            &job.segments,
+        )));
+        let allow_steal = job.supports_ranges && job.total_bytes > 0 && job.segment_count > 1;
+        let max_connections = job.segment_count.min(MAX_SEGMENT_COUNT);
+
         let url = job.url.clone();
-        let mut workers = Vec::new();
+        let meta_job = job.clone();
+        let bandwidth = {
+            let m = mgr.read().await;
+            Arc::clone(&m.bandwidth)
+        };
+
+        let mut workers = JoinSet::new();
+        let mut active_connections = 0usize;
 
         for seg in &job.segments {
-            let seg_id = seg.id;
-            let seg_start = seg.start;
-            let seg_end = seg.end;
-            let url_clone = url.clone();
-            let client_clone = Arc::clone(&client);
-            let mmap_clone = mmap.clone();
-            let tmp_path_clone = tmp_path.clone();
-            let tx_clone = tx.clone();
-            let ua_clone = user_agent.clone();
-            let cookies_clone = cookies.clone();
-
-            let handle = tokio::spawn(async move {
-                crate::engine::worker::download_segment(
-                    job_id,
-                    seg_id,
-                    seg_start,
-                    seg_end,
-                    url_clone,
-                    client_clone,
-                    mmap_clone,
-                    tmp_path_clone,
-                    tx_clone,
-                    ua_clone,
-                    cookies_clone,
-                )
-                .await
-            });
-
-            workers.push(handle);
+            if job.total_bytes > 0 && seg.remaining() == 0 {
+                continue;
+            }
+            spawn_segment_worker(
+                &mut workers,
+                job_id,
+                seg.id,
+                seg.start,
+                seg.end,
+                seg.downloaded,
+                Arc::clone(&steal),
+                url.clone(),
+                Arc::clone(&client),
+                mmap.clone(),
+                tmp_path.clone(),
+                meta_job.clone(),
+                tx.clone(),
+                user_agent.clone(),
+                cookies.clone(),
+                referer.clone(),
+                Arc::clone(&signal.stop),
+                allow_steal,
+                Arc::clone(&bandwidth),
+            );
+            steal.lock().set_active(seg.id);
+            active_connections += 1;
         }
 
-        // Wait for all workers
-        for handle in workers {
-            handle.await??;
+        let mut last_sample_bytes = {
+            steal.lock().total_downloaded()
+        };
+        let mut last_sample_speed = 0.0f64;
+        let mut scaling_enabled = allow_steal && active_connections < max_connections;
+        let mut worker_error = None;
+        let mut ticker = tokio::time::interval(CHECKPOINT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick so the first sample covers a full 2s window.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                joined = workers.join_next(), if !workers.is_empty() => {
+                    match joined {
+                        Some(Ok(Ok(()))) => {
+                            active_connections = active_connections.saturating_sub(1);
+                        }
+                        Some(Ok(Err(e))) => {
+                            active_connections = active_connections.saturating_sub(1);
+                            if !signal.stop.load(Ordering::Relaxed) {
+                                // Local I/O / unrecoverable — remember but do not abort siblings.
+                                warn!("Worker error (siblings continue): {e:#}");
+                                worker_error = Some(e);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("Worker join error: {e}");
+                        }
+                        None => {}
+                    }
+
+                    // If workers drained but unfinished bytes remain, spawn a recovery worker.
+                    if workers.is_empty()
+                        && !signal.stop.load(Ordering::Relaxed)
+                        && allow_steal
+                        && steal.lock().has_remaining()
+                    {
+                        if let Some((new_id, new_start, new_end, already, new_cap)) =
+                            steal.lock().try_steal(MIN_STEAL_BYTES.min(256 * 1024))
+                        {
+                            info!(
+                                "Recovery worker for leftover range {}-{} (seg {})",
+                                new_start, new_end, new_id
+                            );
+                            let end_cap = new_cap;
+                            spawn_segment_worker_with_cap(
+                                &mut workers,
+                                job_id,
+                                new_id,
+                                new_start,
+                                new_end,
+                                already,
+                                end_cap,
+                                Arc::clone(&steal),
+                                url.clone(),
+                                Arc::clone(&client),
+                                mmap.clone(),
+                                tmp_path.clone(),
+                                meta_job.clone(),
+                                tx.clone(),
+                                user_agent.clone(),
+                                cookies.clone(),
+                                referer.clone(),
+                                Arc::clone(&signal.stop),
+                                allow_steal,
+                                Arc::clone(&bandwidth),
+                            );
+                            active_connections += 1;
+                            continue;
+                        }
+                        // Remaining but too small to steal — one worker per unfinished seg.
+                        let orphans: Vec<_> = {
+                            let state = steal.lock();
+                            state
+                                .segments
+                                .iter()
+                                .filter(|s| {
+                                    let end = s.end.load(Ordering::Relaxed);
+                                    let dl = s.downloaded.load(Ordering::Relaxed);
+                                    end.saturating_sub(s.start).saturating_add(1) > dl
+                                })
+                                .map(|s| {
+                                    (
+                                        s.id,
+                                        s.start,
+                                        s.end.load(Ordering::Relaxed),
+                                        s.downloaded.load(Ordering::Relaxed),
+                                        Arc::clone(&s.end),
+                                    )
+                                })
+                                .collect()
+                        };
+                        for (id, start, end, already, end_cap) in orphans {
+                            spawn_segment_worker_with_cap(
+                                &mut workers,
+                                job_id,
+                                id,
+                                start,
+                                end,
+                                already,
+                                end_cap,
+                                Arc::clone(&steal),
+                                url.clone(),
+                                Arc::clone(&client),
+                                mmap.clone(),
+                                tmp_path.clone(),
+                                meta_job.clone(),
+                                tx.clone(),
+                                user_agent.clone(),
+                                cookies.clone(),
+                                referer.clone(),
+                                Arc::clone(&signal.stop),
+                                false, // no steal — finish orphans
+                                Arc::clone(&bandwidth),
+                            );
+                        }
+                        if workers.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if workers.is_empty() {
+                        break;
+                    }
+                }
+
+                _ = ticker.tick() => {
+                    if signal.stop.load(Ordering::Relaxed) {
+                        // Wake join loop by waiting for workers after stop.
+                        if workers.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+
+
+
+                    let downloaded = steal.lock().total_downloaded();
+                    let snapshot = steal.lock().snapshot();
+                    {
+                        let meta = PartMetadata::from_job(&meta_job, snapshot.clone());
+                        if let Err(e) = write_part_meta_atomic(&meta) {
+                            warn!("Checkpoint .part.meta write failed: {e:#}");
+                        }
+                    }
+                    {
+                        let mut m = mgr.write().await;
+                        if let Some(j) = m.jobs.get_mut(&job_id) {
+                            if j.status == DownloadStatus::Downloading {
+                                j.segments = snapshot;
+                                j.downloaded_bytes = downloaded;
+                                let elapsed = CHECKPOINT_INTERVAL.as_secs_f64();
+                                let sample_speed =
+                                    (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed;
+                                j.speed_bps = sample_speed;
+                                if sample_speed > 0.0 && j.total_bytes > downloaded {
+                                    j.eta_seconds = Some(
+                                        (j.total_bytes - downloaded) as f64 / sample_speed,
+                                    );
+                                }
+                                m.persist();
+                            }
+                        }
+                    }
+
+                    let elapsed = CHECKPOINT_INTERVAL.as_secs_f64();
+                    let sample_speed =
+                        (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed.max(0.001);
+
+                    // Adaptive connection scaling: add while marginal gain > ~10%.
+                    if scaling_enabled && active_connections < max_connections {
+                        let gain_ok = last_sample_speed <= 0.0
+                            || (sample_speed - last_sample_speed) / last_sample_speed
+                                > ADAPTIVE_GAIN_THRESHOLD;
+                        if gain_ok {
+                            if let Some((new_id, new_start, new_end, already, new_cap)) =
+                                steal.lock().try_steal(MIN_STEAL_BYTES)
+                            {
+                                info!(
+                                    "Adaptive scale-up → {} connections (seg {} {}-{}, speed {:.0}→{:.0} B/s)",
+                                    active_connections + 1,
+                                    new_id,
+                                    new_start,
+                                    new_end,
+                                    last_sample_speed,
+                                    sample_speed
+                                );
+                                spawn_segment_worker_with_cap(
+                                    &mut workers,
+                                    job_id,
+                                    new_id,
+                                    new_start,
+                                    new_end,
+                                    already,
+                                    new_cap,
+                                    Arc::clone(&steal),
+                                    url.clone(),
+                                    Arc::clone(&client),
+                                    mmap.clone(),
+                                    tmp_path.clone(),
+                                    meta_job.clone(),
+                                    tx.clone(),
+                                    user_agent.clone(),
+                                    cookies.clone(),
+                                    referer.clone(),
+                                    Arc::clone(&signal.stop),
+                                    allow_steal,
+                                    Arc::clone(&bandwidth),
+                                );
+
+                                active_connections += 1;
+                                if active_connections >= max_connections {
+                                    scaling_enabled = false;
+                                }
+                            } else {
+                                scaling_enabled = false;
+                            }
+                        } else if last_sample_speed > 0.0 {
+                            info!(
+                                "Adaptive scaling plateau at {} connections ({:.0}→{:.0} B/s, gain ≤ {:.0}%)",
+                                active_connections,
+                                last_sample_speed,
+                                sample_speed,
+                                ADAPTIVE_GAIN_THRESHOLD * 100.0
+                            );
+                            scaling_enabled = false;
+                        }
+                    }
+
+                    last_sample_speed = sample_speed;
+                    last_sample_bytes = downloaded;
+
+                    if workers.is_empty() {
+                        if !signal.stop.load(Ordering::Relaxed)
+                            && allow_steal
+                            && steal.lock().has_remaining()
+                        {
+                            if let Some((new_id, new_start, new_end, already, new_cap)) =
+                                steal.lock().try_steal(MIN_STEAL_BYTES.min(256 * 1024))
+                            {
+                                spawn_segment_worker_with_cap(
+                                    &mut workers,
+                                    job_id,
+                                    new_id,
+                                    new_start,
+                                    new_end,
+                                    already,
+                                    new_cap,
+                                    Arc::clone(&steal),
+                                    url.clone(),
+                                    Arc::clone(&client),
+                                    mmap.clone(),
+                                    tmp_path.clone(),
+                                    meta_job.clone(),
+                                    tx.clone(),
+                                    user_agent.clone(),
+                                    cookies.clone(),
+                                    referer.clone(),
+                                    Arc::clone(&signal.stop),
+                                    allow_steal,
+                                    Arc::clone(&bandwidth),
+                                );
+
+                                active_connections += 1;
+                            } else {
+                                let orphans: Vec<_> = {
+                                    let state = steal.lock();
+                                    state
+                                        .segments
+                                        .iter()
+                                        .filter(|s| {
+                                            let end = s.end.load(Ordering::Relaxed);
+                                            let dl = s.downloaded.load(Ordering::Relaxed);
+                                            end.saturating_sub(s.start).saturating_add(1) > dl
+                                        })
+                                        .map(|s| {
+                                            (
+                                                s.id,
+                                                s.start,
+                                                s.end.load(Ordering::Relaxed),
+                                                s.downloaded.load(Ordering::Relaxed),
+                                                Arc::clone(&s.end),
+                                            )
+                                        })
+                                        .collect()
+                                };
+                                for (id, start, end, already, end_cap) in orphans {
+                                    spawn_segment_worker_with_cap(
+                                        &mut workers,
+                                        job_id,
+                                        id,
+                                        start,
+                                        end,
+                                        already,
+                                        end_cap,
+                                        Arc::clone(&steal),
+                                        url.clone(),
+                                        Arc::clone(&client),
+                                        mmap.clone(),
+                                        tmp_path.clone(),
+                                        meta_job.clone(),
+                                        tx.clone(),
+                                        user_agent.clone(),
+                                        cookies.clone(),
+                                        referer.clone(),
+                                        Arc::clone(&signal.stop),
+                                        false,
+                                        Arc::clone(&bandwidth),
+                                    );
+                                }
+                                if workers.is_empty() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
-        // Step 5: Flush mmap and mark complete (if we used mmap)
-        if let Some(mmap_arc) = &mmap {
-            let guard = mmap_arc.lock().unwrap();
-            guard.flush()?;
+        // Drain any stragglers after stop.
+        while let Some(joined) = workers.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if !signal.stop.load(Ordering::Relaxed) && worker_error.is_none() {
+                        worker_error = Some(e);
+                    }
+                }
+                Err(_) => {}
+            }
         }
-        
-        // Ensure mmap is dropped so Windows releases the file lock before renaming
+
+        if signal.stop.load(Ordering::Relaxed) {
+            job.segments = steal.lock().snapshot();
+            job.downloaded_bytes = job.segments.iter().map(|s| s.downloaded).sum();
+            job.speed_bps = 0.0;
+            return Self::finalize_stop(mgr, job, mmap, &signal, &tmp_path).await;
+        }
+
+        if let Some(err) = worker_error {
+            job.segments = steal.lock().snapshot();
+            job.downloaded_bytes = job.segments.iter().map(|s| s.downloaded).sum();
+            if let Some(map) = &mmap {
+                let _ = map.flush();
+            }
+            drop(mmap);
+            job.status = DownloadStatus::Failed;
+            job.speed_bps = 0.0;
+            update_state(mgr.clone(), job.clone()).await;
+            return Err(err);
+        }
+
+        // Verify written bytes match Content-Length before marking complete.
+        job.segments = steal.lock().snapshot();
+        let downloaded: u64 = job.segments.iter().map(|s| s.downloaded).sum();
+        job.downloaded_bytes = downloaded;
+
+        if let Some(map) = &mmap {
+            map.flush()?;
+        }
         drop(mmap);
 
-        // Rename .tmp file to final file
+        if job.total_bytes > 0 {
+            if downloaded != job.total_bytes {
+                job.status = DownloadStatus::Failed;
+                job.speed_bps = 0.0;
+                update_state(mgr.clone(), job.clone()).await;
+                bail!(
+                    "Download incomplete: wrote {} bytes, expected Content-Length {}",
+                    downloaded,
+                    job.total_bytes
+                );
+            }
+            // Sequential (non-mmap) path: file length is actual payload size.
+            if !std::path::Path::new(&tmp_path).exists() {
+                job.status = DownloadStatus::Failed;
+                update_state(mgr.clone(), job.clone()).await;
+                bail!("Temp file missing after download: {tmp_path}");
+            }
+            let file_len = std::fs::metadata(&tmp_path)
+                .with_context(|| format!("Failed to stat {tmp_path}"))?
+                .len();
+            // Sparse files are pre-sized to total_bytes; sequential appends grow.
+            // Accept either exact match or sparse preallocation equality.
+            if file_len != job.total_bytes {
+                job.status = DownloadStatus::Failed;
+                job.speed_bps = 0.0;
+                update_state(mgr.clone(), job.clone()).await;
+                bail!(
+                    "File size mismatch: temp file is {} bytes, expected Content-Length {}",
+                    file_len,
+                    job.total_bytes
+                );
+            }
+        }
+
         if let Err(e) = std::fs::rename(&tmp_path, &job.save_path) {
             tracing::warn!("Failed to rename {} to {}: {}", tmp_path, job.save_path, e);
         }
+        // Payload renamed; drop resume sidecar.
+        let _ = std::fs::remove_file(crate::io::sparse::part_meta_path(&job.save_path));
 
         job.status = DownloadStatus::Completed;
+        job.completed_at = Some(chrono::Utc::now());
+        job.downloaded_bytes = if job.total_bytes > 0 {
+            job.total_bytes
+        } else {
+            downloaded
+        };
+        job.speed_bps = 0.0;
+        job.eta_seconds = Some(0.0);
         update_state(mgr.clone(), job.clone()).await;
 
-        info!("✅ Download complete: {}", job.filename);
+        info!("Download complete: {}", job.filename);
+        Ok(())
+    }
+
+    async fn run_youtube_download(
+        mgr: Arc<RwLock<Self>>,
+        mut job: DownloadJob,
+        signal: Arc<JobSignal>,
+        user_agent: Option<String>,
+        cookies: Option<String>,
+        referer: Option<String>,
+    ) -> Result<()> {
+        let update_state = |mgr: Arc<RwLock<Self>>, updated_job: DownloadJob| async move {
+            let mut m = mgr.write().await;
+            if let Some(j) = m.jobs.get_mut(&updated_job.id) {
+                if j.status == DownloadStatus::Cancelled {
+                    return;
+                }
+                if j.status == DownloadStatus::Paused
+                    && !matches!(
+                        updated_job.status,
+                        DownloadStatus::Paused | DownloadStatus::Completed | DownloadStatus::Failed
+                    )
+                {
+                    return;
+                }
+                *j = updated_job.clone();
+                m.events.send(DmEvent::JobUpdated { job: updated_job });
+                m.persist();
+            }
+        };
+
+        job.engine = "youtube".into();
+        job.status = DownloadStatus::Probing;
+        job.supports_ranges = false;
+        let yt_fragments = crate::youtube::DEFAULT_CONCURRENT_FRAGMENTS as usize;
+        job.segment_count = yt_fragments;
+        update_state(mgr.clone(), job.clone()).await;
+        // #region agent log
+        {
+            let payload = serde_json::json!({
+                "sessionId": "d4bb81",
+                "hypothesisId": "E",
+                "location": "manager.rs:run_youtube_download",
+                "message": "entered youtube path",
+                "data": {
+                    "job_id": job.id.to_string(),
+                    "url": job.url,
+                    "quality": job.quality,
+                    "format": job.format,
+                },
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+            });
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = writeln!(f, "{payload}");
+            }
+        }
+        // #endregion
+
+        let opts = crate::youtube::YoutubeOptions {
+            quality: job.quality.clone(),
+            format: job.format.clone(),
+            user_agent: user_agent.clone(),
+            cookies: cookies.clone(),
+            referer: referer.clone(),
+            concurrent_fragments: Some(crate::youtube::DEFAULT_CONCURRENT_FRAGMENTS),
+        };
+
+        // Resolve title / duration up front when possible.
+        // Ensure tools exist before spending time on probe/download.
+        if let Err(e) = crate::youtube::ensure_tools().await {
+            // #region agent log
+            {
+                let payload = serde_json::json!({
+                    "sessionId": "d4bb81",
+                    "hypothesisId": "D",
+                    "location": "manager.rs:ensure_tools",
+                    "message": "ensure_tools failed",
+                    "data": { "error": e.to_string() },
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                });
+                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{payload}");
+                }
+            }
+            // #endregion
+            job.status = DownloadStatus::Failed;
+            job.speed_bps = 0.0;
+            update_state(mgr.clone(), job.clone()).await;
+            return Err(e);
+        }
+
+        /* Extension already sent title + size — skip slow yt-dlp probe (IDM-style handoff). */
+        let client_meta_ready = job.total_bytes > 0
+            && !job.filename.is_empty()
+            && !job.filename.eq_ignore_ascii_case("YouTube video.mp4")
+            && !job.filename.to_ascii_lowercase().starts_with("youtube_");
+
+        if !client_meta_ready {
+        match crate::youtube::probe(&job.url, &opts).await {
+            Ok(info) => {
+                if signal.stop.load(Ordering::Relaxed) {
+                    return Self::finalize_stop(mgr, job, None, &signal, "").await;
+                }
+                let safe = sanitize_yt_name(&info.title);
+                let ext = if job
+                    .quality
+                    .as_deref()
+                    .map(|q| q.eq_ignore_ascii_case("audio"))
+                    .unwrap_or(false)
+                {
+                    "m4a"
+                } else {
+                    "mp4"
+                };
+                let hint = if let Some(q) = job.quality.as_deref().filter(|s| !s.is_empty()) {
+                    format!("{safe} [{q}].{ext}")
+                } else {
+                    format!("{safe}.{ext}")
+                };
+                let parent = PathBuf::from(&job.save_path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let (name, path) = unique_save_path(&parent, &hint);
+                job.filename = name;
+                job.save_path = path;
+                // Estimate size from best matching format when available.
+                if let Some(est) = estimate_yt_size(&info, &opts) {
+                    job.total_bytes = est;
+                } else if let Some(dur) = info.duration {
+                    // Fallback: duration × peak video+audio bitrate.
+                    if let Some(est) = estimate_yt_size_from_bitrate(&info, &opts, dur) {
+                        job.total_bytes = est;
+                    }
+                }
+                // #region agent log
+                {
+                    let payload = serde_json::json!({
+                        "sessionId": "d4bb81",
+                        "hypothesisId": "D",
+                        "location": "manager.rs:probe",
+                        "message": "probe ok",
+                        "data": {
+                            "title": info.title,
+                            "id": info.id,
+                            "total_bytes": job.total_bytes,
+                            "formats": info.formats.len(),
+                        },
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    });
+                    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{payload}");
+                    }
+                }
+                // #endregion
+                info!("YouTube: {} ({})", info.title, info.id);
+            }
+            Err(e) => {
+                warn!("YouTube probe failed: {e:#}");
+                // #region agent log
+                {
+                    let payload = serde_json::json!({
+                        "sessionId": "d4bb81",
+                        "hypothesisId": "D",
+                        "location": "manager.rs:probe",
+                        "message": "probe failed",
+                        "data": { "error": e.to_string() },
+                        "timestamp": chrono::Utc::now().timestamp_millis(),
+                    });
+                    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{payload}");
+                    }
+                }
+                // #endregion
+                job.status = DownloadStatus::Failed;
+                job.speed_bps = 0.0;
+                update_state(mgr.clone(), job.clone()).await;
+                return Err(e).context("YouTube probe failed");
+            }
+        }
+        } else {
+            info!(
+                "YouTube: using extension metadata ({} bytes) — skipping probe",
+                job.total_bytes
+            );
+            update_state(mgr.clone(), job.clone()).await;
+        }
+
+        if signal.stop.load(Ordering::Relaxed) {
+            return Self::finalize_stop(mgr, job, None, &signal, "").await;
+        }
+
+        job.status = DownloadStatus::Downloading;
+        job.segments = vec![Segment::new(0, 0, job.total_bytes.saturating_sub(1))];
+        update_state(mgr.clone(), job.clone()).await;
+
+        let save_dir = PathBuf::from(&job.save_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let preferred = job.filename.clone();
+        let stop = Arc::clone(&signal.stop);
+        let job_id = job.id;
+
+        let known_total = if job.total_bytes > 0 {
+            Some(job.total_bytes)
+        } else {
+            None
+        };
+
+        // Sequential progress sink — spawning a task per tick raced and wiped
+        // the UI back to 0 B / stale totals via out-of-order JobUpdated events.
+        let (prog_tx, mut prog_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::youtube::YoutubeProgress>();
+        let mgr_prog_task = mgr.clone();
+        let prog_job_id = job_id;
+        let progress_task = tokio::spawn(async move {
+            while let Some(progress) = prog_rx.recv().await {
+                let mut m = mgr_prog_task.write().await;
+                let Some(j) = m.jobs.get_mut(&prog_job_id) else {
+                    continue;
+                };
+                if j.status != DownloadStatus::Downloading {
+                    continue;
+                }
+                // Trust yt-dlp running totals (already DASH-accumulated).
+                if progress.total_bytes > j.total_bytes {
+                    j.total_bytes = progress.total_bytes;
+                }
+                if progress.downloaded_bytes >= j.downloaded_bytes {
+                    j.downloaded_bytes = progress.downloaded_bytes;
+                }
+                if j.total_bytes > 0 && j.downloaded_bytes > j.total_bytes {
+                    j.total_bytes = j.downloaded_bytes;
+                }
+
+                if progress.speed_bps > 1.0 {
+                    j.speed_bps = progress.speed_bps;
+                } else if j.speed_bps <= 1.0 && j.downloaded_bytes > 0 {
+                    let elapsed = (chrono::Utc::now() - j.created_at)
+                        .num_milliseconds()
+                        .max(1) as f64
+                        / 1000.0;
+                    if elapsed > 0.5 {
+                        j.speed_bps = j.downloaded_bytes as f64 / elapsed;
+                    }
+                }
+                if j.speed_bps > 1.0 && j.total_bytes > j.downloaded_bytes {
+                    j.eta_seconds =
+                        Some((j.total_bytes - j.downloaded_bytes) as f64 / j.speed_bps);
+                } else if let Some(eta) = progress.eta_seconds.filter(|e| *e > 0.0) {
+                    j.eta_seconds = Some(eta);
+                }
+
+                if j.segments.is_empty() {
+                    j.segments
+                        .push(Segment::new(0, 0, j.total_bytes.saturating_sub(1)));
+                } else {
+                    j.segments[0].end = j.total_bytes.saturating_sub(1);
+                    let span = j.segments[0]
+                        .end
+                        .saturating_sub(j.segments[0].start)
+                        .saturating_add(1);
+                    j.segments[0].downloaded = j.downloaded_bytes.min(span);
+                    j.segments[0].speed_bps = j.speed_bps;
+                }
+                let snapshot = j.clone();
+                m.events.send(DmEvent::JobUpdated {
+                    job: snapshot.clone(),
+                });
+                m.events.send(DmEvent::SegmentProgress {
+                    job_id: prog_job_id,
+                    segment_id: 0,
+                    downloaded: snapshot.downloaded_bytes,
+                    speed_bps: snapshot.speed_bps,
+                });
+            }
+        });
+
+        let result = crate::youtube::download(
+            job.id,
+            &job.url,
+            &save_dir,
+            Some(&preferred),
+            &opts,
+            known_total,
+            stop,
+            move |progress| {
+                // #region agent log
+                {
+                    static PROG_N: AtomicU64 = AtomicU64::new(0);
+                    let n = PROG_N.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 8 || n % 25 == 0 {
+                        let payload = serde_json::json!({
+                            "sessionId": "d4bb81",
+                            "hypothesisId": "C",
+                            "location": "manager.rs:on_progress",
+                            "message": "progress callback",
+                            "data": {
+                                "n": n,
+                                "percent": progress.percent,
+                                "downloaded": progress.downloaded_bytes,
+                                "total": progress.total_bytes,
+                                "speed": progress.speed_bps,
+                                "phase": progress.phase,
+                            },
+                            "timestamp": chrono::Utc::now().timestamp_millis(),
+                            "runId": "post-fix",
+                        });
+                        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "{payload}");
+                        }
+                    }
+                }
+                // #endregion
+                let _ = prog_tx.send(progress);
+            },
+        )
+        .await;
+
+        let _ = progress_task.await;
+
+        // Refresh job from manager (progress tasks may have newer totals).
+        if let Some(latest) = mgr.read().await.jobs.get(&job_id).cloned() {
+            job.total_bytes = latest.total_bytes;
+            job.downloaded_bytes = latest.downloaded_bytes;
+            job.segments = latest.segments;
+            job.filename = latest.filename;
+            job.save_path = latest.save_path;
+        }
+
+        if signal.stop.load(Ordering::Relaxed) {
+            job.speed_bps = 0.0;
+            return Self::finalize_stop(mgr, job, None, &signal, "").await;
+        }
+
+        match result {
+            Ok(path) => {
+                let final_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&job.filename)
+                    .to_string();
+                job.filename = final_name;
+                job.save_path = path.to_string_lossy().to_string();
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    job.total_bytes = meta.len();
+                    job.downloaded_bytes = meta.len();
+                }
+                job.status = DownloadStatus::Completed;
+                job.completed_at = Some(chrono::Utc::now());
+                job.speed_bps = 0.0;
+                job.eta_seconds = Some(0.0);
+                job.segments = vec![Segment {
+                    id: 0,
+                    start: 0,
+                    end: job.total_bytes.saturating_sub(1),
+                    downloaded: job.total_bytes,
+                    speed_bps: 0.0,
+                }];
+                update_state(mgr.clone(), job.clone()).await;
+                info!("YouTube download complete: {}", job.filename);
+                Ok(())
+            }
+            Err(e) => {
+                if signal.stop.load(Ordering::Relaxed) {
+                    job.speed_bps = 0.0;
+                    return Self::finalize_stop(mgr, job, None, &signal, "").await;
+                }
+                job.status = DownloadStatus::Failed;
+                job.speed_bps = 0.0;
+                update_state(mgr.clone(), job.clone()).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn finalize_stop(
+        mgr: Arc<RwLock<Self>>,
+        mut job: DownloadJob,
+        mmap: Option<SharedMmap>,
+        signal: &JobSignal,
+        tmp_path: &str,
+    ) -> Result<()> {
+        if let Some(map) = &mmap {
+            let _ = map.sync_after_write(0, 0);
+        }
+        drop(mmap);
+
+        if signal.cancel.load(Ordering::Relaxed) {
+            remove_part_artifacts(&job.save_path);
+            if job.engine == "youtube" {
+                let save_dir = std::path::PathBuf::from(&job.save_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+                crate::youtube::cleanup_yt_temp(&save_dir, job.id);
+            }
+            if !tmp_path.is_empty() {
+                let _ = std::fs::remove_file(tmp_path);
+            }
+            if signal.delete_file.load(Ordering::Relaxed) {
+                let path = std::path::PathBuf::from(&job.save_path);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            let mut m = mgr.write().await;
+            m.persist();
+            return Ok(());
+        }
+
+        // Durable pause: meta reflects flushed bytes only.
+        if !job.segments.is_empty() {
+            let meta = PartMetadata::from_job(&job, job.segments.clone());
+            if let Err(e) = write_part_meta_atomic(&meta) {
+                warn!("Failed to write pause .part.meta: {e:#}");
+            }
+        }
+
+        job.status = DownloadStatus::Paused;
+        job.speed_bps = 0.0;
+        let mut m = mgr.write().await;
+        let updated = if let Some(j) = m.jobs.get_mut(&job.id) {
+            if j.status != DownloadStatus::Cancelled {
+                if !job.segments.is_empty() {
+                    j.segments = job.segments.clone();
+                    j.downloaded_bytes = job.segments.iter().map(|s| s.downloaded).sum();
+                }
+                j.status = DownloadStatus::Paused;
+                j.speed_bps = 0.0;
+                Some(j.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(updated) = updated {
+            m.events.send(DmEvent::JobUpdated { job: updated });
+            m.persist();
+        }
         Ok(())
     }
 
@@ -222,7 +1451,166 @@ impl DownloadManager {
     }
 }
 
-/// Divide [0, total_bytes) into `count` evenly-distributed segments
+fn is_googlevideo_url(url: &str) -> bool {
+    url.contains("googlevideo.com")
+}
+
+fn sanitize_yt_name(title: &str) -> String {
+    let mut s: String = title
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    s = s.trim().trim_matches('.').to_string();
+    if s.len() > 180 {
+        s.truncate(180);
+    }
+    if s.is_empty() {
+        "YouTube video".into()
+    } else {
+        s
+    }
+}
+
+fn estimate_yt_size(
+    info: &crate::youtube::YoutubeInfo,
+    opts: &crate::youtube::YoutubeOptions,
+) -> Option<u64> {
+    let q = opts
+        .quality
+        .as_deref()
+        .unwrap_or("best")
+        .trim()
+        .to_ascii_lowercase();
+    if q == "audio" || q == "audio-only" {
+        return info
+            .formats
+            .iter()
+            .filter(|f| f.is_audio && !f.is_video)
+            .filter_map(|f| f.filesize.or(f.filesize_approx))
+            .max();
+    }
+    let height = q.trim_end_matches('p').parse::<u32>().ok();
+    let mut candidates: Vec<_> = info
+        .formats
+        .iter()
+        .filter(|f| f.is_video)
+        .collect();
+    if let Some(h) = height {
+        let capped: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|f| f.height.unwrap_or(0) <= h)
+            .collect();
+        if !capped.is_empty() {
+            candidates = capped;
+        }
+    }
+    let best_video = candidates
+        .iter()
+        .max_by_key(|f| {
+            (
+                f.height.unwrap_or(0),
+                f.filesize.or(f.filesize_approx).unwrap_or(0),
+            )
+        })?;
+    let video_size = best_video.filesize.or(best_video.filesize_approx).unwrap_or(0);
+    let audio_size = if best_video.is_progressive {
+        0
+    } else {
+        info.formats
+            .iter()
+            .filter(|f| f.is_audio && !f.is_video)
+            .filter_map(|f| f.filesize.or(f.filesize_approx))
+            .max()
+            .unwrap_or(0)
+    };
+    let total = video_size + audio_size;
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn estimate_yt_size_from_bitrate(
+    info: &crate::youtube::YoutubeInfo,
+    opts: &crate::youtube::YoutubeOptions,
+    duration_secs: f64,
+) -> Option<u64> {
+    if duration_secs <= 0.0 {
+        return None;
+    }
+    let q = opts
+        .quality
+        .as_deref()
+        .unwrap_or("best")
+        .trim()
+        .to_ascii_lowercase();
+    let height = q.trim_end_matches('p').parse::<u32>().ok();
+    let mut v_tbr = 0.0;
+    for f in info.formats.iter().filter(|f| f.is_video) {
+        if let Some(h) = height {
+            if f.height.unwrap_or(0) > h {
+                continue;
+            }
+        }
+        if let Some(tbr) = f.tbr {
+            if tbr > v_tbr {
+                v_tbr = tbr;
+            }
+        }
+    }
+    let a_tbr = info
+        .formats
+        .iter()
+        .filter(|f| f.is_audio && !f.is_video)
+        .filter_map(|f| f.tbr)
+        .fold(0.0_f64, f64::max);
+    let tbr = if q == "audio" || q == "audio-only" {
+        a_tbr
+    } else {
+        v_tbr + a_tbr
+    };
+    if tbr <= 0.0 {
+        return None;
+    }
+    // tbr is kbps → bytes
+    Some(((tbr * 1000.0 / 8.0) * duration_secs) as u64)
+}
+
+fn unique_save_path(save_dir: &PathBuf, filename: &str) -> (String, String) {
+    let mut filename = filename.to_string();
+    let mut save_path = save_dir.join(&filename);
+    if save_path.exists() {
+        let path = std::path::Path::new(&filename);
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&filename);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+
+        let mut counter = 1;
+        loop {
+            let new_name = format!("{} ({}){}", stem, counter, ext);
+            save_path = save_dir.join(&new_name);
+            if !save_path.exists() {
+                filename = new_name;
+                break;
+            }
+            counter += 1;
+        }
+    }
+    (filename, save_path.to_string_lossy().to_string())
+}
+
 pub fn divide_into_segments(total: u64, count: usize) -> Vec<Segment> {
     if total == 0 || count == 0 {
         return vec![Segment::new(0, 0, 0)];
@@ -239,4 +1627,106 @@ pub fn divide_into_segments(total: u64, count: usize) -> Vec<Segment> {
         segs.push(Segment::new(i, start, end));
     }
     segs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_segment_worker(
+    workers: &mut JoinSet<Result<()>>,
+    job_id: JobId,
+    seg_id: usize,
+    start: u64,
+    end: u64,
+    already: u64,
+    steal: Arc<parking_lot::Mutex<StealState>>,
+    url: String,
+    client: Arc<HttpClient>,
+    mmap: Option<SharedMmap>,
+    tmp_path: String,
+    meta_job: DownloadJob,
+    tx: EventPublisher,
+    user_agent: Option<String>,
+    cookies: Option<String>,
+    referer: Option<String>,
+    stop: Arc<AtomicBool>,
+    allow_steal: bool,
+    bandwidth: Arc<BandwidthLimiter>,
+) {
+    let end_cap = steal
+        .lock()
+        .segments
+        .iter()
+        .find(|l| l.id == seg_id)
+        .map(|l| Arc::clone(&l.end))
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(end)));
+    spawn_segment_worker_with_cap(
+        workers,
+        job_id,
+        seg_id,
+        start,
+        end,
+        already,
+        end_cap,
+        steal,
+        url,
+        client,
+        mmap,
+        tmp_path,
+        meta_job,
+        tx,
+        user_agent,
+        cookies,
+        referer,
+        stop,
+        allow_steal,
+        bandwidth,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_segment_worker_with_cap(
+    workers: &mut JoinSet<Result<()>>,
+    job_id: JobId,
+    seg_id: usize,
+    start: u64,
+    end: u64,
+    already: u64,
+    end_cap: Arc<AtomicU64>,
+    steal: Arc<parking_lot::Mutex<StealState>>,
+    url: String,
+    client: Arc<HttpClient>,
+    mmap: Option<SharedMmap>,
+    tmp_path: String,
+    meta_job: DownloadJob,
+    tx: EventPublisher,
+    user_agent: Option<String>,
+    cookies: Option<String>,
+    referer: Option<String>,
+    stop: Arc<AtomicBool>,
+    allow_steal: bool,
+    bandwidth: Arc<BandwidthLimiter>,
+) {
+    workers.spawn(async move {
+        crate::engine::worker::download_segment(
+            job_id,
+            seg_id,
+            start,
+            end,
+            end_cap,
+            url,
+            client,
+            mmap,
+            tmp_path,
+            meta_job,
+            tx,
+            user_agent,
+            cookies,
+            referer,
+            stop,
+            Some(steal),
+            allow_steal,
+            already,
+            bandwidth,
+        )
+        .await
+    });
 }

@@ -1,22 +1,59 @@
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
-    extract::ws::{Message, WebSocket},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
+use super::error::{self, ErrorCode};
+use super::ws;
 use super::SharedManager;
+use crate::engine::manager::DownloadManager;
+use crate::engine::{DownloadStatus, DmEvent};
+use crate::network::client::HttpClient;
+use crate::settings::DaemonSettings;
 
-// ─── Health ──────────────────────────────────────────────────────────────────
-
-pub async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "version": "0.1.0" }))
+pub async fn health() -> impl IntoResponse {
+    let tools = crate::youtube::tools_health();
+    let status = tools.status.clone();
+    let http = match status.as_str() {
+        "error" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::OK,
+    };
+    (
+        http,
+        Json(serde_json::json!({
+            "status": status,
+            "version": "0.1.0",
+            "message": tools.message,
+            "youtube": {
+                "yt_dlp": tools.yt_dlp,
+                "ffmpeg": tools.ffmpeg,
+            }
+        })),
+    )
 }
 
-// ─── List Downloads ───────────────────────────────────────────────────────────
+pub async fn get_settings(State(mgr): State<SharedManager>) -> impl IntoResponse {
+    let mgr = mgr.read().await;
+    Json(mgr.settings.clone())
+}
+
+pub async fn put_settings(
+    State(mgr): State<SharedManager>,
+    Json(settings): Json<DaemonSettings>,
+) -> impl IntoResponse {
+    let mut m = mgr.write().await;
+    match m.update_settings(settings.clone()) {
+        Ok(()) => (StatusCode::OK, Json(settings)).into_response(),
+        Err(e) => error::api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::SettingsSaveFailed,
+            e.to_string(),
+        ),
+    }
+}
 
 pub async fn list_downloads(State(mgr): State<SharedManager>) -> impl IntoResponse {
     let mgr = mgr.read().await;
@@ -24,7 +61,17 @@ pub async fn list_downloads(State(mgr): State<SharedManager>) -> impl IntoRespon
     Json(jobs)
 }
 
-// ─── Add Download ─────────────────────────────────────────────────────────────
+pub async fn select_folder() -> impl IntoResponse {
+    let path = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new().pick_folder()
+    }).await.unwrap_or(None);
+
+    if let Some(p) = path {
+        Json(serde_json::json!({ "path": p.to_string_lossy() }))
+    } else {
+        Json(serde_json::json!({ "path": None::<String> }))
+    }
+}
 
 #[derive(Deserialize)]
 pub struct AddDownloadRequest {
@@ -33,11 +80,46 @@ pub struct AddDownloadRequest {
     pub segments: Option<usize>,
     pub user_agent: Option<String>,
     pub cookies: Option<String>,
+    pub referer: Option<String>,
+    pub filename: Option<String>,
+    /// Display title from the browser (used to build a real filename immediately).
+    pub title: Option<String>,
+    /// Known size from the extension (Content-Length / player JSON) — skips "Unknown".
+    pub total_bytes: Option<u64>,
+    /// Alias for total_bytes (extension convenience).
+    pub size: Option<u64>,
+    /// YouTube quality: best | 2160 | 1440 | 1080 | 720 | 480 | 360 | audio
+    pub quality: Option<String>,
+    /// Raw yt-dlp `-f` selector
+    pub format: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct AddDownloadResponse {
-    pub id: Uuid,
+#[derive(Deserialize)]
+pub struct YoutubeProbeRequest {
+    pub url: String,
+    pub user_agent: Option<String>,
+    pub cookies: Option<String>,
+    pub referer: Option<String>,
+}
+
+pub async fn youtube_probe(Json(req): Json<YoutubeProbeRequest>) -> impl IntoResponse {
+    let opts = crate::youtube::YoutubeOptions {
+        quality: None,
+        format: None,
+        user_agent: req.user_agent,
+        cookies: req.cookies,
+        referer: req.referer,
+        concurrent_fragments: None,
+    };
+    match crate::youtube::probe(&req.url, &opts).await {
+        Ok(info) => (StatusCode::OK, Json(serde_json::to_value(info).unwrap_or_default()))
+            .into_response(),
+        Err(e) => error::api_error(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::ProbeFailed,
+            e.to_string(),
+        ),
+    }
 }
 
 pub async fn add_download(
@@ -51,118 +133,153 @@ pub async fn add_download(
             .to_string()
     });
 
+    let known_bytes = req.total_bytes.or(req.size).filter(|&n| n > 0);
+
     let job_res = {
         let mut m = mgr.write().await;
-        m.add_download(req.url, save_dir, req.segments)
+        m.add_download(
+            req.url,
+            save_dir,
+            req.segments,
+            req.user_agent.clone(),
+            req.cookies.clone(),
+            req.referer.clone(),
+            req.filename.clone(),
+            req.title.clone(),
+            known_bytes,
+            req.quality.clone(),
+            req.format.clone(),
+        )
     };
 
     match job_res {
         Ok(job) => {
             let id = job.id.to_string();
-            // Spawn the core execution task
-            let mgr_clone = mgr.clone();
-            let ua_clone = req.user_agent;
-            let cookies_clone = req.cookies;
-            
-            // We need an HttpClient to pass to the task. 
-            // We can construct a fresh one here or borrow it from the manager? 
-            // Manager no longer gives public access to http_client, so let's instantiate one
-            // or just make http_client public.
-            // Wait, we can get it from the manager.
             let client = {
                 let m = mgr.read().await;
-                std::sync::Arc::clone(&m.http_client) // Need to make http_client pub in manager.rs
+                std::sync::Arc::clone(&m.http_client)
             };
-
-            tokio::spawn(async move {
-                if let Err(e) = crate::engine::manager::DownloadManager::run_download(
-                    mgr_clone.clone(),
-                    job.clone(),
-                    client,
-                    ua_clone,
-                    cookies_clone,
-                ).await {
-                    tracing::error!("Download {} failed: {}", job.id, e);
-                    let m = mgr_clone.read().await;
-                    let _ = m.event_tx.send(crate::engine::DmEvent::Error {
-                        id: Some(job.id),
-                        message: e.to_string(),
-                    });
-                }
-            });
-
+            spawn_job(
+                mgr,
+                job,
+                client,
+                req.user_agent,
+                req.cookies,
+                req.referer,
+            );
             (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
-        },
-        Err(e) => (
+        }
+        Err(e) => error::api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+            ErrorCode::DownloadFailed,
+            e.to_string(),
+        ),
     }
 }
 
-// ─── Cancel Download ──────────────────────────────────────────────────────────
-// NOTE: Path extractor must come before State in axum 0.7 for DELETE routes.
+#[derive(Deserialize)]
+pub struct CancelQuery {
+    #[serde(default)]
+    pub delete_file: bool,
+}
 
 pub async fn cancel_download(
+    Path(id): Path<Uuid>,
+    Query(query): Query<CancelQuery>,
+    State(mgr): State<SharedManager>,
+) -> impl IntoResponse {
+    let mut mgr = mgr.write().await;
+    if mgr.cancel(&id, query.delete_file) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error::not_found("Job not found")
+    }
+}
+
+pub async fn pause_download(
     Path(id): Path<Uuid>,
     State(mgr): State<SharedManager>,
 ) -> impl IntoResponse {
     let mut mgr = mgr.write().await;
-    if mgr.cancel(&id) {
+    if mgr.pause(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Job not found" }))).into_response()
+        error::bad_request("Download is not running")
     }
 }
 
-// ─── WebSocket Handler ────────────────────────────────────────────────────────
-
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
+pub async fn resume_download(
+    Path(id): Path<Uuid>,
     State(mgr): State<SharedManager>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, mgr))
-}
-
-async fn handle_ws(socket: WebSocket, mgr: SharedManager) {
-    let mut rx = {
-        let mgr = mgr.read().await;
-        mgr.subscribe()
-    };
-
-    let (mut sender, mut receiver) = socket.split();
-
-    // Send current jobs snapshot immediately on connect
-    {
-        let mgr = mgr.read().await;
-        let jobs: Vec<_> = mgr.list_jobs().into_iter().cloned().collect();
-        let snapshot = serde_json::json!({ "type": "snapshot", "jobs": jobs });
-        let _ = sender.send(Message::Text(snapshot.to_string().into())).await;
-    }
-
-    // Stream live events
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(ev) => {
-                        if let Ok(json) = serde_json::to_string(&ev) {
-                            if sender.send(Message::Text(json.into())).await.is_err() {
-                                break; // Client disconnected
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            msg = receiver.next() => {
-                match msg {
-                    None | Some(Err(_)) => break, // Client disconnected
-                    Some(Ok(Message::Close(_))) => break,
-                    _ => {} // Ignore other messages
-                }
+    let (job, client) = {
+        let mut m = mgr.write().await;
+        match m.begin_resume(&id) {
+            Ok(job) => (job, std::sync::Arc::clone(&m.http_client)),
+            Err(e) => {
+                return error::bad_request(e.to_string());
             }
         }
-    }
+    };
+
+    spawn_job(
+        mgr,
+        job.clone(),
+        client,
+        job.user_agent.clone(),
+        job.cookies.clone(),
+        job.referer.clone(),
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn ws_handler(
+    ws_upgrade: WebSocketUpgrade,
+    State(mgr): State<SharedManager>,
+) -> impl IntoResponse {
+    ws_upgrade.on_upgrade(move |socket| ws::handle_ws(socket, mgr))
+}
+
+fn spawn_job(
+    mgr: SharedManager,
+    job: crate::engine::DownloadJob,
+    client: std::sync::Arc<HttpClient>,
+    user_agent: Option<String>,
+    cookies: Option<String>,
+    referer: Option<String>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = DownloadManager::run_download(
+            mgr.clone(),
+            job.clone(),
+            client,
+            user_agent,
+            cookies,
+            referer,
+        )
+        .await
+        {
+            tracing::error!("Download {} failed: {}", job.id, e);
+            let mut m = mgr.write().await;
+            let failed_job = if let Some(j) = m.jobs.get_mut(&job.id) {
+                if j.status != DownloadStatus::Cancelled && j.status != DownloadStatus::Paused {
+                    j.status = DownloadStatus::Failed;
+                    j.speed_bps = 0.0;
+                    Some(j.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(updated) = failed_job {
+                m.events.send(DmEvent::JobUpdated { job: updated });
+                m.persist();
+            }
+            m.events.send(DmEvent::Error {
+                id: Some(job.id),
+                message: e.to_string(),
+            });
+        }
+    });
 }

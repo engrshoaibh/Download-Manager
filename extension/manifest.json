@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Download Manager Integration",
+  "short_name": "DM Capture",
+  "version": "1.6.2",
+  "description": "IDM-style sniffer — direct googlevideo streams with segmented downloads, YouTube quality menu, daemon capture.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    },
+    "default_title": "Download Manager"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content/sniffer.js"],
+      "css": ["content/sniffer.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "cookies",
+    "storage",
+    "tabs",
+    "notifications",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:7373/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["capture/capture.html", "capture/capture.css", "capture/capture.js", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

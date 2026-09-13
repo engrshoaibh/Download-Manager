@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Download Manager</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <img src="../icons/icon48.png" width="32" height="32" alt="" />
+    <div>
+      <h1>Download Manager</h1>
+      <p id="daemon" class="daemon">Checking daemon…</p>
+    </div>
+  </header>
+
+  <section>
+    <label class="switch-row">
+      <span>Capture downloads</span>
+      <input type="checkbox" id="enabled" />
+    </label>
+
+    <label class="field">
+      <span>Capture mode</span>
+      <select id="captureMode">
+        <option value="ask">Ask (IDM-style dialog)</option>
+        <option value="auto">Auto — send to DM</option>
+        <option value="off">Off — browser only</option>
+      </select>
+    </label>
+
+    <label class="switch-row">
+      <span>Intercept browser downloads</span>
+      <input type="checkbox" id="interceptBrowserDownloads" />
+    </label>
+
+    <label class="switch-row">
+      <span>Open dialog on link click</span>
+      <input type="checkbox" id="linkClickCapture" />
+    </label>
+
+    <label class="switch-row">
+      <span>Catch video page links (not YouTube suggestions)</span>
+      <input type="checkbox" id="catchVideoPageLinks" />
+    </label>
+
+    <label class="switch-row">
+      <span>Video download banner</span>
+      <input type="checkbox" id="videoBanner" />
+    </label>
+
+    <label class="switch-row">
+      <span>Media grabber panel</span>
+      <input type="checkbox" id="mediaGrabber" />
+    </label>
+
+    <label class="switch-row">
+      <span>Alt+click forces capture</span>
+      <input type="checkbox" id="altClickCapture" />
+    </label>
+
+    <label class="field">
+      <span>Default segments</span>
+      <input type="number" id="segments" min="1" max="64" />
+    </label>
+
+    <label class="field">
+      <span>File types (comma-separated)</span>
+      <textarea id="extensions" rows="4" spellcheck="false"></textarea>
+    </label>
+  </section>
+
+  <footer>
+    <button type="button" id="save" class="primary">Save</button>
+    <span id="saved" class="saved" hidden>Saved</span>
+  </footer>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

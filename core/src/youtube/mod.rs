@@ -1,0 +1,1947 @@
+//! YouTube / yt-dlp processor — resolve formats, download + FFmpeg merge, report progress.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tracing::{info, warn};
+
+const YT_DLP_RELEASE: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+/// Machine-readable progress line emitted by yt-dlp (`--progress-template`).
+const DM_PROG_PREFIX: &str = "[DMPROG]";
+const STDERR_TAIL_LINES: usize = 40;
+/// Default interval between yt-dlp self-update checks.
+pub const YTDLP_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+
+// #region agent log
+fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let payload = serde_json::json!({
+        "sessionId": "d4bb81",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": chrono::Utc::now().timestamp_millis(),
+    });
+    let line = payload.to_string();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+// #endregion
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YoutubeFormat {
+    pub format_id: String,
+    pub ext: String,
+    pub resolution: Option<String>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
+    pub filesize: Option<u64>,
+    pub filesize_approx: Option<u64>,
+    pub tbr: Option<f64>,
+    pub note: Option<String>,
+    pub is_video: bool,
+    pub is_audio: bool,
+    pub is_progressive: bool,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YoutubeInfo {
+    pub id: String,
+    pub title: String,
+    pub duration: Option<f64>,
+    pub thumbnail: Option<String>,
+    pub webpage_url: String,
+    pub formats: Vec<YoutubeFormat>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct YoutubeOptions {
+    /// e.g. "1080", "720", "best", "audio"
+    pub quality: Option<String>,
+    /// Raw yt-dlp `-f` selector (overrides quality)
+    pub format: Option<String>,
+    pub user_agent: Option<String>,
+    pub cookies: Option<String>,
+    pub referer: Option<String>,
+    /// Parallel DASH/HLS fragment downloads (`yt-dlp -N`). Default 16.
+    pub concurrent_fragments: Option<u32>,
+}
+
+/// Default parallel fragment count (Arroxy / yt-dlp multi-connection style).
+pub const DEFAULT_CONCURRENT_FRAGMENTS: u32 = 16;
+
+#[derive(Debug, Clone, Default)]
+pub struct YoutubeProgress {
+    pub percent: f64,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bps: f64,
+    pub eta_seconds: Option<f64>,
+    pub phase: String,
+    pub filename: Option<String>,
+    pub is_estimate: bool,
+}
+
+/// True for watch / shorts / embed / youtu.be page URLs (not googlevideo CDN).
+pub fn is_youtube_page_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = u.path().to_ascii_lowercase();
+
+    if host == "youtu.be" {
+        return path.trim_matches('/').len() >= 6;
+    }
+    if !(host == "youtube.com"
+        || host == "www.youtube.com"
+        || host == "m.youtube.com"
+        || host == "music.youtube.com"
+        || host.ends_with(".youtube.com"))
+    {
+        return false;
+    }
+    path.starts_with("/watch")
+        || path.starts_with("/shorts/")
+        || path.starts_with("/embed/")
+        || path.starts_with("/live/")
+        || u.query_pairs().any(|(k, _)| k == "v")
+}
+
+pub fn is_googlevideo_url(url: &str) -> bool {
+    url.contains("googlevideo.com") && url.contains("videoplayback")
+}
+
+/// Prefer a watch-page URL for yt-dlp. Falls back to `referer` when the
+/// capture URL is a googlevideo CDN stream.
+pub fn resolve_youtube_target(url: &str, referer: Option<&str>) -> Option<String> {
+    if is_youtube_page_url(url) {
+        return Some(normalize_watch_url(url));
+    }
+    if let Some(r) = referer {
+        if is_youtube_page_url(r) && (is_googlevideo_url(url) || url.contains("youtube.com")) {
+            return Some(normalize_watch_url(r));
+        }
+    }
+    None
+}
+
+pub fn normalize_watch_url(url: &str) -> String {
+    let Ok(u) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let path = u.path();
+
+    if host == "youtu.be" {
+        let id = path.trim_matches('/');
+        if !id.is_empty() {
+            return format!("https://www.youtube.com/watch?v={id}");
+        }
+    }
+
+    if path.starts_with("/shorts/") || path.starts_with("/embed/") || path.starts_with("/live/") {
+        if let Some(id) = path.split('/').filter(|s| !s.is_empty()).nth(1) {
+            return format!("https://www.youtube.com/watch?v={id}");
+        }
+    }
+
+    if let Some((_, v)) = u.query_pairs().find(|(k, _)| k == "v") {
+        return format!("https://www.youtube.com/watch?v={v}");
+    }
+
+    url.to_string()
+}
+
+pub fn format_selector(opts: &YoutubeOptions) -> String {
+    if let Some(f) = explicit_format_id(opts) {
+        return f;
+    }
+    let q = normalized_quality(opts);
+
+    if q == "audio" || q == "audio-only" || q == "bestaudio" {
+        return "ba/b".into();
+    }
+
+    // Prefer exact / near-exact height. Never put progressive `b` ahead of
+    // adaptive webm/AV1 (4K is almost never muxed progressive mp4).
+    if let Some(h) = parse_quality_height(&q) {
+        let floor = ((h as f64) * 0.75) as u32; // e.g. 2160 → 1620 (keeps 1440+ path)
+        return format!(
+            "bv*[height={h}]+ba/bv*[height>={floor}][height<={h}]+ba/wv*[height={h}]+ba/wv*[height>={floor}][height<={h}]+ba/bv*[height<={h}]+ba/wv*[height<={h}]+ba/b[height>={floor}]/b"
+        );
+    }
+
+    "bv*+ba/b".into()
+}
+
+/// yt-dlp `-S` sort: prefer requested resolution, then bitrate, then mp4-friendly.
+pub fn format_sort(opts: &YoutubeOptions) -> Option<String> {
+    if explicit_format_id(opts).is_some() {
+        return None;
+    }
+    let q = normalized_quality(opts);
+    if q == "audio" || q == "audio-only" || q == "bestaudio" {
+        return Some("abr,ext:m4a:mp4".into());
+    }
+    if let Some(h) = parse_quality_height(&q) {
+        return Some(format!("res:{h},br,ext:mp4:m4a"));
+    }
+    Some("res,br,ext:mp4:m4a".into())
+}
+
+fn normalized_quality(opts: &YoutubeOptions) -> String {
+    opts.quality
+        .as_deref()
+        .unwrap_or("best")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Raw yt-dlp `-f` only when it looks like a real format id / expression —
+/// not container labels like "mp4" / "ts" from the extension UI.
+fn explicit_format_id(opts: &YoutubeOptions) -> Option<String> {
+    let f = opts.format.as_ref()?.trim();
+    if f.is_empty() {
+        return None;
+    }
+    let fl = f.to_ascii_lowercase();
+    if matches!(
+        fl.as_str(),
+        "mp4" | "m4a" | "webm" | "mkv" | "ts" | "hls" | "dash" | "m4v"
+    ) {
+        return None;
+    }
+    Some(f.to_string())
+}
+
+fn parse_quality_height(q: &str) -> Option<u32> {
+    if q == "best" || q.is_empty() || q == "audio" || q == "audio-only" || q == "bestaudio" {
+        return None;
+    }
+    // "1080", "1080p", "1080p hd", "2160p 4k", …
+    if let Some(caps) = regex_height(q) {
+        return Some(caps);
+    }
+    q.trim_end_matches('p').parse().ok()
+}
+
+fn regex_height(q: &str) -> Option<u32> {
+    let bytes = q.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let n = std::str::from_utf8(&bytes[start..i])
+                .ok()?
+                .parse::<u32>()
+                .ok()?;
+            if (144..=4320).contains(&n) {
+                return Some(n);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+pub async fn ensure_tools() -> Result<(PathBuf, Option<PathBuf>)> {
+    let ytdlp = find_or_fetch_ytdlp().await?;
+    verify_executable(&ytdlp, "yt-dlp").await?;
+    let ffmpeg = find_ffmpeg();
+    if let Some(ref ff) = ffmpeg {
+        if let Err(e) = verify_executable(ff, "ffmpeg").await {
+            warn!("FFmpeg found but not usable ({e:#}) — DASH merge may fail");
+        }
+    } else {
+        warn!("FFmpeg not found — DASH audio/video merge may fail");
+    }
+    // #region agent log
+    agent_log(
+        "D",
+        "youtube/mod.rs:ensure_tools",
+        "tools resolved",
+        serde_json::json!({
+            "ytdlp": ytdlp.display().to_string(),
+            "ffmpeg": ffmpeg.as_ref().map(|p| p.display().to_string()),
+        }),
+    );
+    // #endregion
+    Ok((ytdlp, ffmpeg))
+}
+
+/// Startup /health preflight: confirm binaries exist and can be executed.
+pub async fn verify_tools_at_startup() -> ToolsHealth {
+    let mut health = tools_health();
+    if health.yt_dlp.available {
+        if let Some(ref path) = health.yt_dlp.path {
+            if let Err(e) = verify_executable(Path::new(path), "yt-dlp").await {
+                health.yt_dlp.available = false;
+                health.yt_dlp.error = Some(e.to_string());
+                health.ok = false;
+            }
+        }
+    }
+    if health.ffmpeg.available {
+        if let Some(ref path) = health.ffmpeg.path {
+            if let Err(e) = verify_executable(Path::new(path), "ffmpeg").await {
+                health.ffmpeg.available = false;
+                health.ffmpeg.error = Some(e.to_string());
+                // ffmpeg missing is degraded, not fatal for non-YouTube downloads
+                if health.status == "ok" {
+                    health.status = "degraded".into();
+                }
+            }
+        }
+    } else if health.status == "ok" {
+        health.status = "degraded".into();
+    }
+    health
+}
+
+async fn verify_executable(path: &Path, label: &str) -> Result<()> {
+    if !path.is_file() {
+        bail!("{label} binary missing at {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)?.permissions().mode();
+        if mode & 0o111 == 0 {
+            bail!("{label} at {} is not executable", path.display());
+        }
+    }
+    let arg = if label == "ffmpeg" {
+        "-version"
+    } else {
+        "--version"
+    };
+    let mut cmd = Command::new(path);
+    cmd.arg(arg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(8), cmd.status()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => bail!("{label} exited with {status} during version check"),
+        Ok(Err(e)) => bail!("{label} failed to run: {e}"),
+        Err(_) => bail!("{label} version check timed out"),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolStatus {
+    pub available: bool,
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolsHealth {
+    /// `ok` | `degraded` | `error`
+    pub status: String,
+    pub ok: bool,
+    pub yt_dlp: ToolStatus,
+    pub ffmpeg: ToolStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Synchronous path presence check (no process spawn) for `/health`.
+pub fn tools_health() -> ToolsHealth {
+    let yt = find_ytdlp();
+    let ff = find_ffmpeg();
+    let yt_dlp = match yt {
+        Some(p) => ToolStatus {
+            available: true,
+            path: Some(p.to_string_lossy().into()),
+            error: None,
+        },
+        None => ToolStatus {
+            available: false,
+            path: None,
+            error: Some(ytdlp_install_hint().into()),
+        },
+    };
+    let ffmpeg = match ff {
+        Some(p) => ToolStatus {
+            available: true,
+            path: Some(p.to_string_lossy().into()),
+            error: None,
+        },
+        None => ToolStatus {
+            available: false,
+            path: None,
+            error: Some(
+                "FFmpeg not found — install ffmpeg or place ffmpeg.exe in %LOCALAPPDATA%\\download-manager\\bin"
+                    .into(),
+            ),
+        },
+    };
+
+    let (status, ok, message) = if !yt_dlp.available {
+        (
+            "error".into(),
+            false,
+            Some(format!(
+                "yt-dlp missing: {}",
+                yt_dlp.error.clone().unwrap_or_default()
+            )),
+        )
+    } else if !ffmpeg.available {
+        (
+            "degraded".into(),
+            true,
+            Some(
+                "yt-dlp OK; FFmpeg missing — YouTube DASH merges may fail".into(),
+            ),
+        )
+    } else {
+        ("ok".into(), true, None)
+    };
+
+    ToolsHealth {
+        status,
+        ok,
+        yt_dlp,
+        ffmpeg,
+        message,
+    }
+}
+
+async fn find_or_fetch_ytdlp() -> Result<PathBuf> {
+    if let Some(p) = find_ytdlp() {
+        return Ok(p);
+    }
+    info!("yt-dlp not found — attempting short download window…");
+    match tokio::time::timeout(Duration::from_secs(25), fetch_ytdlp()).await {
+        Ok(Ok(p)) => Ok(p),
+        Ok(Err(e)) => Err(e).context(ytdlp_install_hint()),
+        Err(_) => bail!("{}", ytdlp_install_hint()),
+    }
+}
+
+fn ytdlp_install_hint() -> &'static str {
+    "yt-dlp is required for YouTube downloads. Install it with: winget install yt-dlp.yt-dlp   OR place yt-dlp.exe in %LOCALAPPDATA%\\download-manager\\bin"
+}
+
+fn bin_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("download-manager")
+        .join("bin")
+}
+
+fn find_ytdlp() -> Option<PathBuf> {
+    let names = ["yt-dlp.exe", "yt-dlp", "ytdlp.exe"];
+    for name in names {
+        if let Ok(path) = which(name) {
+            return Some(path);
+        }
+    }
+    let bundled = bin_dir().join(if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    });
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in names {
+                let p = dir.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Public status helpers for `/health` (compat wrappers).
+#[allow(dead_code)]
+pub fn find_ytdlp_status() -> serde_json::Value {
+    serde_json::to_value(&tools_health().yt_dlp).unwrap_or_default()
+}
+
+#[allow(dead_code)]
+pub fn find_ffmpeg_status() -> serde_json::Value {
+    serde_json::to_value(&tools_health().ffmpeg).unwrap_or_default()
+}
+
+fn find_ffmpeg() -> Option<PathBuf> {
+    for name in ["ffmpeg.exe", "ffmpeg"] {
+        if let Ok(p) = which(name) {
+            return Some(p);
+        }
+    }
+    let bundled = bin_dir().join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn which(name: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("where")
+            .arg(name)
+            .output()
+            .context("where failed")?;
+        if !output.status.success() {
+            bail!("not found");
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            bail!("not found");
+        }
+        Ok(PathBuf::from(line))
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("which")
+            .arg(name)
+            .output()
+            .context("which failed")?;
+        if !output.status.success() {
+            bail!("not found");
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let line = text.lines().next().unwrap_or("").trim();
+        if line.is_empty() {
+            bail!("not found");
+        }
+        Ok(PathBuf::from(line))
+    }
+}
+
+async fn fetch_ytdlp() -> Result<PathBuf> {
+    let dir = bin_dir();
+    std::fs::create_dir_all(&dir).context("create bin dir")?;
+    let dest_name = if cfg!(windows) {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    };
+    let dest = dir.join(dest_name);
+    let tmp = dir.join(format!("{dest_name}.partial"));
+    let url = if cfg!(windows) {
+        YT_DLP_RELEASE
+    } else {
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("download-manager/0.1")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
+        .build()?;
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .context("download yt-dlp")?
+        .error_for_status()
+        .context("yt-dlp HTTP error")?
+        .bytes()
+        .await
+        .context("read yt-dlp body")?;
+
+    if bytes.len() < 1_000_000 {
+        bail!("yt-dlp download looks too small ({} bytes)", bytes.len());
+    }
+    // Atomic install: write temp in same dir, then rename over the live binary.
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    std::fs::write(&tmp, &bytes).context("write yt-dlp partial")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&tmp, perms)?;
+    }
+    // On Windows, rename over a running yt-dlp.exe can fail — replace via delete+rename.
+    if dest.exists() {
+        let bak = dir.join(format!("{dest_name}.bak"));
+        let _ = std::fs::remove_file(&bak);
+        if std::fs::rename(&dest, &bak).is_err() {
+            let _ = std::fs::remove_file(&dest);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::rename(&bak, &dest);
+            return Err(e).context("finalize yt-dlp");
+        }
+        let _ = std::fs::remove_file(&bak);
+    } else {
+        std::fs::rename(&tmp, &dest).context("finalize yt-dlp")?;
+    }
+    info!("Installed yt-dlp → {}", dest.display());
+    Ok(dest)
+}
+
+/// Download the latest yt-dlp into the managed bin dir (atomic swap).
+/// Returns `true` if the binary was replaced.
+pub async fn update_ytdlp() -> Result<bool> {
+    let before = find_ytdlp().and_then(|p| std::fs::metadata(&p).ok().map(|m| m.len()));
+    let path = fetch_ytdlp().await?;
+    let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let changed = before != Some(after);
+    if changed {
+        info!("yt-dlp updated ({} → {} bytes)", before.unwrap_or(0), after);
+    } else {
+        info!("yt-dlp refresh complete (unchanged size {after})");
+    }
+    Ok(changed)
+}
+
+/// Background task: periodically refresh the managed yt-dlp binary.
+pub fn spawn_ytdlp_update_scheduler(interval: Duration) {
+    tokio::spawn(async move {
+        // Let the API come up before the first network hit.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        loop {
+            match update_ytdlp().await {
+                Ok(true) => info!("Scheduled yt-dlp self-update applied"),
+                Ok(false) => info!("Scheduled yt-dlp check: already current"),
+                Err(e) => warn!("Scheduled yt-dlp update failed: {e:#}"),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn write_netscape_cookies(cookies: &str, path: &Path) -> Result<()> {
+    // Netscape cookie file header + synthetic youtube.com cookies from Cookie header.
+    let mut out = String::from("# Netscape HTTP Cookie File\n# Generated by download-manager\n");
+    for part in cookies.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, value) = match part.split_once('=') {
+            Some((n, v)) => (n.trim(), v.trim()),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        // domain, flag, path, secure, expiry, name, value
+        out.push_str(&format!(
+            ".youtube.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n"
+        ));
+    }
+    std::fs::write(path, out).context("write cookie file")?;
+    Ok(())
+}
+
+pub async fn probe(url: &str, opts: &YoutubeOptions) -> Result<YoutubeInfo> {
+    let (ytdlp, _) = ensure_tools().await?;
+    let target = resolve_youtube_target(url, opts.referer.as_deref())
+        .unwrap_or_else(|| url.to_string());
+
+    // Prefer cookie-less first — extension Cookie headers commonly trigger
+    // "The page needs to be reloaded". Fall back to cookies for age-gated media.
+    let attempts: &[(bool, &str)] = &[(false, "no_cookies"), (true, "with_cookies")];
+    let mut last_err = String::new();
+
+    for (use_cookies, label) in attempts {
+        if *use_cookies && opts.cookies.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            continue;
+        }
+        let cookie_path = if *use_cookies {
+            tempfile_cookie(opts.cookies.as_deref())?
+        } else {
+            None
+        };
+
+        let mut cmd = Command::new(&ytdlp);
+        cmd.arg("-J")
+            .arg("--no-playlist")
+            .arg("--no-warnings")
+            // Do NOT force player_client=web/android — that collapses the
+            // adaptive ladder to progressive ~360p. yt-dlp's default clients
+            // return the full format list (including 4K webm/AV1).
+            .arg(&target)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(ref ua) = opts.user_agent {
+            if !ua.trim().is_empty() {
+                cmd.arg("--user-agent").arg(ua);
+            }
+        }
+        if let Some(ref path) = cookie_path {
+            cmd.arg("--cookies").arg(path);
+            if let Some(ref r) = opts.referer {
+                cmd.arg("--referer").arg(r);
+            }
+        }
+
+        let output = cmd.output().await.context("run yt-dlp -J")?;
+        if let Some(path) = cookie_path {
+            let _ = std::fs::remove_file(path);
+        }
+
+        if output.status.success() {
+            // #region agent log
+            agent_log(
+                "D",
+                "youtube/mod.rs:probe",
+                "probe succeeded",
+                serde_json::json!({ "attempt": label, "target": target }),
+            );
+            // #endregion
+            let json: serde_json::Value =
+                serde_json::from_slice(&output.stdout).context("parse yt-dlp JSON")?;
+            return parse_info(json, &target);
+        }
+
+        last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // #region agent log
+        agent_log(
+            "D",
+            "youtube/mod.rs:probe",
+            "probe attempt failed",
+            serde_json::json!({
+                "attempt": label,
+                "error": last_err.chars().take(300).collect::<String>(),
+            }),
+        );
+        // #endregion
+    }
+
+    bail!("yt-dlp probe failed: {last_err}");
+}
+
+fn parse_info(json: serde_json::Value, fallback_url: &str) -> Result<YoutubeInfo> {
+    let id = json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let title = json
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("YouTube video")
+        .to_string();
+    let duration = json.get("duration").and_then(|v| v.as_f64());
+    let thumbnail = json
+        .get("thumbnail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let webpage_url = json
+        .get("webpage_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback_url)
+        .to_string();
+
+    let mut formats = Vec::new();
+    if let Some(arr) = json.get("formats").and_then(|v| v.as_array()) {
+        for f in arr {
+            let format_id = f
+                .get("format_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if format_id.is_empty() {
+                continue;
+            }
+            let vcodec = f
+                .get("vcodec")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| s != "none");
+            let acodec = f
+                .get("acodec")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| s != "none");
+            let is_video = vcodec.is_some();
+            let is_audio = acodec.is_some();
+            if !is_video && !is_audio {
+                continue;
+            }
+            formats.push(YoutubeFormat {
+                format_id,
+                ext: f
+                    .get("ext")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mp4")
+                    .to_string(),
+                resolution: f
+                    .get("resolution")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        f.get("height")
+                            .and_then(|v| v.as_u64())
+                            .map(|h| format!("{h}p"))
+                    }),
+                height: f.get("height").and_then(|v| v.as_u64()).map(|h| h as u32),
+                fps: f.get("fps").and_then(|v| v.as_f64()),
+                vcodec,
+                acodec,
+                filesize: f.get("filesize").and_then(|v| v.as_u64()),
+                filesize_approx: f.get("filesize_approx").and_then(|v| v.as_u64()),
+                tbr: f.get("tbr").and_then(|v| v.as_f64()),
+                note: f
+                    .get("format_note")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                is_video,
+                is_audio,
+                is_progressive: is_video && is_audio,
+                url: f.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            });
+        }
+    }
+
+    // Prefer higher resolutions first for UI lists.
+    formats.sort_by(|a, b| {
+        b.height
+            .unwrap_or(0)
+            .cmp(&a.height.unwrap_or(0))
+            .then_with(|| {
+                let asz = a.filesize.or(a.filesize_approx).unwrap_or(0);
+                let bsz = b.filesize.or(b.filesize_approx).unwrap_or(0);
+                bsz.cmp(&asz)
+            })
+    });
+
+    Ok(YoutubeInfo {
+        id,
+        title,
+        duration,
+        thumbnail,
+        webpage_url,
+        formats,
+    })
+}
+
+fn tempfile_cookie(cookies: Option<&str>) -> Result<Option<PathBuf>> {
+    let Some(c) = cookies.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let dir = std::env::temp_dir().join("download-manager");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("cookies-{}.txt", uuid::Uuid::new_v4()));
+    write_netscape_cookies(c, &path)?;
+    Ok(Some(path))
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    s = s.trim().trim_matches('.').to_string();
+    if s.len() > 180 {
+        s.truncate(180);
+    }
+    if s.is_empty() {
+        "youtube_video".into()
+    } else {
+        s
+    }
+}
+
+/// Hidden work folder under the save directory for yt-dlp fragments / .part files.
+struct HiddenYtTemp {
+    job_dir: PathBuf,
+}
+
+impl HiddenYtTemp {
+    fn create(save_dir: &Path, job_id: uuid::Uuid) -> Result<Self> {
+        let root = save_dir.join(".dm-yt");
+        std::fs::create_dir_all(&root).context("create .dm-yt")?;
+        set_hidden_attr(&root);
+        let job_dir = root.join(job_id.to_string());
+        std::fs::create_dir_all(&job_dir).context("create yt work dir")?;
+        set_hidden_attr(&job_dir);
+        Ok(Self { job_dir })
+    }
+
+    pub fn cleanup(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.job_dir);
+    }
+}
+
+pub fn cleanup_yt_temp(save_dir: &std::path::Path, job_id: uuid::Uuid) {
+    let root = save_dir.join(".dm-yt");
+    let job_dir = root.join(job_id.to_string());
+    let _ = std::fs::remove_dir_all(&job_dir);
+}
+
+fn set_hidden_attr(path: &Path) {
+    #[cfg(windows)]
+    {
+        // `attrib +H` is enough — Explorer hides the folder without needing winapi crates.
+        let _ = std::process::Command::new("attrib")
+            .arg("+H")
+            .arg(path)
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+    }
+}
+
+/// Sum all file bytes under the yt-dlp work dir (fragments grow continuously).
+fn sum_workdir_bytes(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in rd.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file() {
+            total = total.saturating_add(meta.len());
+        } else if meta.is_dir() {
+            total = total.saturating_add(sum_workdir_bytes(&entry.path()));
+        }
+    }
+    total
+}
+
+/// Move the merged file out of the hidden work dir into Downloads.
+fn move_finished_to_save_dir(src: &Path, save_dir: &Path, preferred_name: &str) -> Result<PathBuf> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    let stem = Path::new(preferred_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("youtube_video");
+    let stem = sanitize_filename(stem);
+    let mut dest = save_dir.join(format!("{stem}.{ext}"));
+    if dest.exists() {
+        for i in 1..1000 {
+            let candidate = save_dir.join(format!("{stem} ({i}).{ext}"));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+    if src == dest {
+        return Ok(dest);
+    }
+    match std::fs::rename(src, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            std::fs::copy(src, &dest).context("copy finished youtube file")?;
+            let _ = std::fs::remove_file(src);
+            Ok(dest)
+        }
+    }
+}
+
+/// Confirm yt-dlp's chosen format is close to the requested height before spending bandwidth.
+async fn assert_selected_height(
+    ytdlp: &Path,
+    url: &str,
+    selector: &str,
+    sort: Option<&str>,
+    want_height: u32,
+    opts: &YoutubeOptions,
+) -> Result<()> {
+    let mut cmd = Command::new(ytdlp);
+    cmd.arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("-f")
+        .arg(selector)
+        .arg("--print")
+        .arg("%(height)s")
+        .arg("--skip-download")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(s) = sort {
+        cmd.arg("-S").arg(s);
+    }
+    if let Some(ref ua) = opts.user_agent {
+        if !ua.trim().is_empty() {
+            cmd.arg("--user-agent").arg(ua);
+        }
+    }
+    // Prefer cookie-less preflight — matches the download path.
+
+    let output = cmd.output().await.context("yt-dlp format preflight")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "yt-dlp could not resolve a {}p format: {}",
+            want_height,
+            truncate_for_log(err.trim(), 400)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let got = stdout
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("none") {
+                return None;
+            }
+            t.parse::<u32>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+
+    let min_ok = ((want_height as f64) * 0.75) as u32;
+    if got < min_ok {
+        bail!(
+            "Requested {want_height}p but yt-dlp selected {got}p (need at least {min_ok}p). \
+             The site may be blocking adaptive formats — update yt-dlp or try again."
+        );
+    }
+    info!("yt-dlp preflight OK: requested {want_height}p → selected {got}p");
+    Ok(())
+}
+
+/// Run yt-dlp download with live progress callbacks. Honors `stop` for pause/cancel.
+///
+/// On FFmpeg/merge failure, retries the whole download once, then fails with the
+/// stderr tail attached for diagnostics.
+pub async fn download(
+    job_id: uuid::Uuid,
+    url: &str,
+    save_dir: &Path,
+    preferred_name: Option<&str>,
+    opts: &YoutubeOptions,
+    known_total: Option<u64>,
+    stop: Arc<AtomicBool>,
+    mut on_progress: impl FnMut(YoutubeProgress),
+) -> Result<PathBuf> {
+    let mut last_err = String::new();
+    for attempt in 1..=2u32 {
+        match download_once(
+            job_id,
+            url,
+            save_dir,
+            preferred_name,
+            opts,
+            known_total,
+            Arc::clone(&stop),
+            &mut on_progress,
+            attempt,
+        )
+        .await
+        {
+            Ok(path) => return Ok(path),
+            Err(e) if stop.load(Ordering::Relaxed) || e.to_string().contains("stopped") => {
+                return Err(e);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                let merge = is_merge_or_ffmpeg_error(&last_err);
+                if attempt == 1 && merge {
+                    warn!(
+                        "yt-dlp merge/ffmpeg failed (attempt 1) — retrying once: {}",
+                        truncate_for_log(&last_err, 240)
+                    );
+                    on_progress(YoutubeProgress {
+                        phase: "retrying".into(),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    bail!("{last_err}")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_once(
+    job_id: uuid::Uuid,
+    url: &str,
+    save_dir: &Path,
+    preferred_name: Option<&str>,
+    opts: &YoutubeOptions,
+    known_total: Option<u64>,
+    stop: Arc<AtomicBool>,
+    on_progress: &mut impl FnMut(YoutubeProgress),
+    attempt: u32,
+) -> Result<PathBuf> {
+    let (ytdlp, ffmpeg) = ensure_tools().await?;
+    let target = resolve_youtube_target(url, opts.referer.as_deref())
+        .unwrap_or_else(|| url.to_string());
+    let selector = format_selector(opts);
+
+    std::fs::create_dir_all(save_dir).context("create save dir")?;
+
+    // Keep DASH fragments / .part files out of Downloads — hidden work dir only.
+    let mut yt_temp = HiddenYtTemp::create(save_dir, job_id)?;
+    let work_dir = yt_temp.job_dir.clone();
+
+    let stem = if let Some(name) = preferred_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let raw = Path::new(name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        sanitize_filename(raw)
+    } else {
+        "youtube_video".into()
+    };
+    let out_tmpl = work_dir
+        .join(format!("{}.%(ext)s", stem))
+        .to_string_lossy()
+        .to_string();
+    let final_hint = preferred_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let p = Path::new(s);
+            if p.extension().is_some() {
+                sanitize_filename(s)
+            } else {
+                format!("{}.mp4", sanitize_filename(s))
+            }
+        })
+        .unwrap_or_else(|| format!("{stem}.mp4"));
+
+    // Extension Cookie headers often break yt-dlp ("page needs to be reloaded").
+    // Default clients already expose the full adaptive ladder without cookies.
+    let cookie_path = if attempt > 1 {
+        tempfile_cookie(opts.cookies.as_deref())?
+    } else {
+        None
+    };
+
+    // Single progress template — dual templates caused empty stderr on some builds.
+    let progress_template = format!(
+        "{DM_PROG_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s"
+    );
+
+    let fragments = opts
+        .concurrent_fragments
+        .unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS)
+        .clamp(1, 32);
+
+    // Fail closed: refuse to silently download 360p when the user asked for 4K.
+    if let Some(want) = parse_quality_height(&normalized_quality(opts)) {
+        if let Err(e) = assert_selected_height(
+            &ytdlp,
+            &target,
+            &selector,
+            format_sort(opts).as_deref(),
+            want,
+            opts,
+        )
+        .await
+        {
+            if let Some(path) = &cookie_path {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    }
+
+    let mut cmd = Command::new(&ytdlp);
+    cmd.arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("--newline")
+        .arg("--progress")
+        .arg("--progress-template")
+        .arg(&progress_template)
+        // Parallel fragment fetches — same idea as Arroxy/aria2 multi-connection speed.
+        .arg("-N")
+        .arg(fragments.to_string())
+        .arg("-f")
+        .arg(&selector);
+    if let Some(sort) = format_sort(opts) {
+        cmd.arg("-S").arg(sort);
+    }
+    // Temp intermediates stay in the hidden work dir; final file is moved out after merge.
+    cmd.arg("--paths")
+        .arg(format!("temp:{}", work_dir.display()))
+        .arg("--paths")
+        .arg(format!("home:{}", work_dir.display()))
+        .arg("--merge-output-format")
+        .arg("mp4")
+        .arg("-o")
+        .arg(&out_tmpl)
+        .arg("--print")
+        .arg("before_dl:format_id=%(format_id)s height=%(height)s ext=%(ext)s")
+        .arg("--print")
+        .arg("after_move:filepath")
+        .arg("--print")
+        .arg("after_move:filename")
+        .arg(&target)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+
+    if let Some(ff) = ffmpeg.as_ref() {
+        if let Some(dir) = ff.parent() {
+            cmd.arg("--ffmpeg-location").arg(dir);
+        }
+    }
+    if let Some(ref ua) = opts.user_agent {
+        if !ua.trim().is_empty() {
+            cmd.arg("--user-agent").arg(ua);
+        }
+    }
+    if let Some(ref path) = cookie_path {
+        cmd.arg("--cookies").arg(path);
+    }
+    if let Some(ref r) = opts.referer {
+        cmd.arg("--referer").arg(r);
+    }
+    cmd.arg("-c");
+
+    info!(
+        "yt-dlp attempt {attempt}: {} | -f {} | cookies={} | tmp={}",
+        target,
+        selector,
+        cookie_path.is_some(),
+        work_dir.display()
+    );
+
+    let mut child = cmd.spawn().context("spawn yt-dlp")?;
+    let stdout = child.stdout.take().context("yt-dlp stdout")?;
+    let stderr = child.stderr.take().context("yt-dlp stderr")?;
+
+    // Dedicated readers so progress lines aren't starved by select! fairness.
+    let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if err_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if out_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut final_path: Option<PathBuf> = None;
+    let mut last_progress = YoutubeProgress {
+        phase: "downloading".into(),
+        total_bytes: known_total.unwrap_or(0),
+        ..Default::default()
+    };
+    let mut stream_acc = DashProgressAccum {
+        estimate_total: known_total.unwrap_or(0),
+        ..Default::default()
+    };
+    let mut stderr_done = false;
+    let mut stdout_done = false;
+    let mut stderr_tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+    let stderr_lines_seen = Arc::new(AtomicU64::new(0));
+    let progress_parsed = Arc::new(AtomicU64::new(0));
+
+    let mut last_part_bytes: u64 = 0;
+    let mut last_part_instant = std::time::Instant::now();
+    let mut poll_ticks: u64 = 0;
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let status = loop {
+        if stop.load(Ordering::Relaxed) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            if let Some(path) = &cookie_path {
+                let _ = std::fs::remove_file(path);
+            }
+            yt_temp.cleanup();
+            bail!("stopped");
+        }
+
+        tokio::select! {
+            _ = ticker.tick() => {
+                poll_ticks += 1;
+                // Sum everything in the hidden work dir (fragments + .part + partials).
+                let part_bytes = sum_workdir_bytes(&work_dir);
+                if part_bytes > 0 {
+                    let elapsed = last_part_instant.elapsed().as_secs_f64().max(0.001);
+                    let delta = part_bytes.saturating_sub(last_part_bytes);
+                    let speed = if last_part_bytes == 0 {
+                        0.0
+                    } else if delta > 0 && elapsed >= 0.15 {
+                        delta as f64 / elapsed
+                    } else if last_progress.speed_bps > 1.0 {
+                        last_progress.speed_bps
+                    } else {
+                        0.0
+                    };
+                    if part_bytes != last_part_bytes || poll_ticks % 2 == 0 {
+                        if part_bytes != last_part_bytes {
+                            last_part_bytes = part_bytes;
+                            last_part_instant = std::time::Instant::now();
+                        }
+                        
+                        // FFmpeg merge phase creates a duplicate output file alongside the inputs.
+                        // Summing the workdir during this phase inflates the size by 2x, causing UI glitches.
+                        if last_progress.phase != "merging" {
+                            last_progress.downloaded_bytes =
+                                part_bytes.max(last_progress.downloaded_bytes);
+                        }
+
+                        last_progress.total_bytes = reconcile_yt_total(
+                            &stream_acc,
+                            last_progress.total_bytes,
+                            last_progress.downloaded_bytes,
+                            last_progress.is_estimate,
+                        );
+                        normalize_progress_fields(&mut last_progress, speed);
+                        if last_progress.phase != "merging" {
+                            last_progress.phase = "downloading".into();
+                        }
+                        on_progress(last_progress.clone());
+                    }
+                }
+            }
+            line = err_rx.recv(), if !stderr_done => {
+                match line {
+                    Some(line) => {
+                        push_stderr_tail(&mut stderr_tail, &line);
+                        let n = stderr_lines_seen.fetch_add(1, Ordering::Relaxed) + 1;
+                        let parsed = parse_progress_line(&line);
+                        if n <= 8 || parsed.is_some() || line.contains("ERROR") || line.contains("[Merger]") {
+                            agent_log(
+                                if parsed.is_some() { "A" } else { "B" },
+                                "youtube/mod.rs:stderr",
+                                "stderr line",
+                                serde_json::json!({
+                                    "n": n,
+                                    "attempt": attempt,
+                                    "line": line.chars().take(220).collect::<String>(),
+                                }),
+                            );
+                        }
+                        if parsed.is_some() {
+                            progress_parsed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(p) = parsed {
+                            let mut merged = apply_dash_progress(&mut stream_acc, p);
+                            if last_part_bytes > merged.downloaded_bytes {
+                                merged.downloaded_bytes = last_part_bytes;
+                            }
+                            if merged.speed_bps <= 1.0 && last_progress.speed_bps > 1.0 {
+                                merged.speed_bps = last_progress.speed_bps;
+                            }
+                            if merged.eta_seconds.is_none() {
+                                merged.eta_seconds = last_progress.eta_seconds;
+                            }
+                            let speed = merged.speed_bps;
+                            normalize_progress_fields(&mut merged, speed);
+                            last_progress = merged;
+                            on_progress(last_progress.clone());
+                        } else if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
+                            last_progress.phase = "merging".into();
+                            last_progress.speed_bps = 0.0;
+                            last_progress.eta_seconds = None;
+                            on_progress(last_progress.clone());
+                        } else if line.contains("[download] Destination:") {
+                            if let Some(path) = line.split("Destination:").nth(1) {
+                                last_progress.filename = Some(path.trim().to_string());
+                            }
+                        }
+                    }
+                    None => stderr_done = true,
+                }
+            }
+            line = out_rx.recv(), if !stdout_done => {
+                match line {
+                    Some(line) => {
+                        let t = line.trim();
+                        if t.is_empty() { continue; }
+                        if let Some(p) = parse_progress_line(t) {
+                            let mut merged = apply_dash_progress(&mut stream_acc, p);
+                            if last_part_bytes > merged.downloaded_bytes {
+                                merged.downloaded_bytes = last_part_bytes;
+                            }
+                            let speed = merged.speed_bps;
+                            normalize_progress_fields(&mut merged, speed);
+                            last_progress = merged;
+                            on_progress(last_progress.clone());
+                            continue;
+                        }
+                        if t.starts_with("format_id=") || t.contains(" height=") {
+                            info!("yt-dlp selected: {t}");
+                            continue;
+                        }
+                        let path = PathBuf::from(t);
+                        if path.exists() || (t.contains('.') && !t.contains('=')) {
+                            final_path = Some(path);
+                        }
+                    }
+                    None => stdout_done = true,
+                }
+            }
+            status = child.wait() => {
+                break status.context("wait yt-dlp")?;
+            }
+        }
+    };
+
+    // Drain any remaining lines after process exit.
+    while let Ok(line) = err_rx.try_recv() {
+        push_stderr_tail(&mut stderr_tail, &line);
+        if let Some(p) = parse_progress_line(&line) {
+            let mut merged = apply_dash_progress(&mut stream_acc, p);
+            merged.downloaded_bytes = merged.downloaded_bytes.max(last_part_bytes);
+            let speed = merged.speed_bps;
+            normalize_progress_fields(&mut merged, speed);
+            last_progress = merged;
+            on_progress(last_progress.clone());
+        }
+    }
+    while let Ok(line) = out_rx.try_recv() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("format_id=") || t.contains(" height=") {
+            continue;
+        }
+        let path = PathBuf::from(t);
+        if path.exists() || (t.contains('.') && !t.contains('=')) {
+            final_path = Some(path);
+        }
+    }
+    if let Some(path) = cookie_path {
+        let _ = std::fs::remove_file(path);
+    }
+    if stop.load(Ordering::Relaxed) {
+        yt_temp.cleanup();
+        bail!("stopped");
+    }
+    if !status.success() {
+        let tail = stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n");
+        let merge = is_merge_or_ffmpeg_error(&tail);
+        agent_log(
+            "D",
+            "youtube/mod.rs:download",
+            "yt-dlp failed",
+            serde_json::json!({
+                "status": format!("{status}"),
+                "attempt": attempt,
+                "merge_failure": merge,
+                "stderr_tail": tail.chars().take(1500).collect::<String>(),
+                "progress_parsed": progress_parsed.load(Ordering::Relaxed),
+                "workdir_bytes": sum_workdir_bytes(&work_dir),
+            }),
+        );
+        yt_temp.cleanup();
+        if merge {
+            bail!(
+                "yt-dlp/ffmpeg merge failed (exit {status}). stderr tail:\n{}",
+                truncate_for_log(&tail, 2000)
+            );
+        }
+        bail!(
+            "yt-dlp exited with {status}. stderr tail:\n{}",
+            truncate_for_log(&tail, 2000)
+        );
+    }
+
+    let path = if let Some(p) = final_path.filter(|p| p.exists()) {
+        p
+    } else if let Some(name) = last_progress.filename.clone() {
+        let p = PathBuf::from(name);
+        if p.exists() {
+            p
+        } else {
+            find_newest_media(&work_dir).context("could not locate yt-dlp output")?
+        }
+    } else {
+        find_newest_media(&work_dir).context("could not locate yt-dlp output")?
+    };
+
+    // Promote the finished file into Downloads (visible); wipe the hidden work dir.
+    let visible = move_finished_to_save_dir(&path, save_dir, &final_hint)?;
+    yt_temp.cleanup();
+
+    last_progress.percent = 100.0;
+    last_progress.phase = "done".into();
+    last_progress.filename = Some(visible.display().to_string());
+    last_progress.speed_bps = 0.0;
+    last_progress.eta_seconds = Some(0.0);
+    if let Ok(meta) = std::fs::metadata(&visible) {
+        last_progress.total_bytes = meta.len();
+        last_progress.downloaded_bytes = meta.len();
+    } else if last_progress.total_bytes == 0 {
+        last_progress.downloaded_bytes = last_progress.downloaded_bytes.max(last_part_bytes);
+    } else {
+        last_progress.downloaded_bytes = last_progress.total_bytes;
+    }
+    on_progress(last_progress);
+
+    Ok(visible)
+}
+
+fn push_stderr_tail(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() >= STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(line.to_string());
+}
+
+fn is_merge_or_ffmpeg_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("[merger]")
+        || lower.contains("error merging")
+        || lower.contains("ffmpeg exited")
+        || lower.contains("ffmpeg not found")
+        || lower.contains("postprocessing: error")
+        || (lower.contains("ffmpeg") && lower.contains("error"))
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+/// Keep percent / ETA consistent with HTTP job fields for the UI.
+fn normalize_progress_fields(p: &mut YoutubeProgress, speed_hint: f64) {
+    if p.total_bytes > 0 {
+        if p.downloaded_bytes > p.total_bytes {
+            p.downloaded_bytes = p.total_bytes;
+        }
+        if p.percent <= 0.0 || !p.percent.is_finite() {
+            p.percent = (p.downloaded_bytes as f64 / p.total_bytes as f64 * 100.0).clamp(0.0, 100.0);
+        }
+    }
+    if speed_hint > 1.0 {
+        p.speed_bps = speed_hint;
+    }
+    if p.eta_seconds.is_none() && p.speed_bps > 1.0 && p.total_bytes > p.downloaded_bytes {
+        p.eta_seconds = Some((p.total_bytes - p.downloaded_bytes) as f64 / p.speed_bps);
+    }
+}
+
+/// Tracks DASH video+audio as two sequential yt-dlp downloads so the UI sees
+/// one continuous progress bar instead of resetting at the audio stream.
+#[derive(Debug, Default, Clone)]
+struct DashProgressAccum {
+    finished_bytes: u64,
+    last_stream_downloaded: u64,
+    current_stream_total: u64,
+    estimate_total: u64,
+}
+
+fn apply_dash_progress(acc: &mut DashProgressAccum, mut p: YoutubeProgress) -> YoutubeProgress {
+    // New stream: yt-dlp resets downloaded near zero after finishing video/audio.
+    if acc.last_stream_downloaded > 256 * 1024
+        && p.downloaded_bytes + 256 * 1024 < acc.last_stream_downloaded
+    {
+        acc.finished_bytes = acc
+            .finished_bytes
+            .saturating_add(acc.last_stream_downloaded);
+        acc.current_stream_total = 0;
+    }
+    if p.total_bytes > 0 {
+        acc.current_stream_total = p.total_bytes;
+    }
+    acc.last_stream_downloaded = p.downloaded_bytes;
+
+    let combined_dl = acc.finished_bytes.saturating_add(p.downloaded_bytes);
+    let live_total = if acc.current_stream_total > 0 {
+        acc.finished_bytes.saturating_add(acc.current_stream_total)
+    } else {
+        combined_dl
+    };
+    p.downloaded_bytes = combined_dl;
+    p.total_bytes = reconcile_yt_total(acc, live_total, combined_dl, p.is_estimate);
+    p
+}
+
+/// Prefer live yt-dlp stream totals over inflated extension/probe estimates
+/// (e.g. 933 MB announced vs ~40 MB actually selected).
+fn reconcile_yt_total(acc: &DashProgressAccum, live_total: u64, downloaded: u64, is_estimate: bool) -> u64 {
+    let live = live_total.max(downloaded);
+    if live == 0 {
+        return acc.estimate_total;
+    }
+    if acc.estimate_total == 0 {
+        return live;
+    }
+    // If we have a firm estimate from the extension but yt-dlp only has a volatile estimate,
+    // don't let yt-dlp inflate the total wildly. Cap it at the initial firm estimate.
+    if is_estimate && acc.estimate_total > 0 && live > acc.estimate_total {
+        return acc.estimate_total.max(downloaded);
+    }
+    // Once yt-dlp reports a real stream size, drop a wildly larger estimate.
+    if acc.current_stream_total > 0
+        && acc.estimate_total > live.saturating_mul(2).max(live + 8 * 1024 * 1024)
+    {
+        return live;
+    }
+    acc.estimate_total.max(live)
+}
+
+fn find_newest_media(dir: &Path) -> Result<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).context("read save dir")? {
+        let entry = entry?;
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "mp4" | "mkv" | "webm" | "m4a" | "mp3" | "opus" | "ogg"
+        ) {
+            continue;
+        }
+        let modified = entry.metadata()?.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match &best {
+            None => best = Some((modified, path)),
+            Some((t, _)) if modified > *t => best = Some((modified, path)),
+            _ => {}
+        }
+    }
+    best.map(|(_, p)| p)
+        .ok_or_else(|| anyhow::anyhow!("no media file found in {}", dir.display()))
+}
+
+fn parse_progress_line(line: &str) -> Option<YoutubeProgress> {
+    if let Some(p) = parse_dmprog_line(line) {
+        return Some(p);
+    }
+    // Legacy human-readable: [download]  45.2% of  120.50MiB at    3.20MiB/s ETA 00:21
+    if !line.contains("[download]") || !line.contains('%') {
+        return None;
+    }
+    if line.contains("Destination:") || line.contains("Downloading item") {
+        return None;
+    }
+    let percent = {
+        let idx = line.find('%')?;
+        let start = line[..idx].rfind(|c: char| c.is_ascii_whitespace())?;
+        line[start..idx].trim().parse::<f64>().ok()?
+    };
+
+    let total_bytes = extract_size_after(line, " of ").unwrap_or(0);
+    let downloaded_bytes = if total_bytes > 0 {
+        ((percent / 100.0) * total_bytes as f64) as u64
+    } else {
+        0
+    };
+    let speed_bps = extract_speed(line).unwrap_or(0.0);
+    let eta_seconds = extract_eta(line);
+
+    let mut p = YoutubeProgress {
+        percent,
+        downloaded_bytes,
+        total_bytes,
+        speed_bps,
+        eta_seconds,
+        phase: "downloading".into(),
+        filename: None,
+        is_estimate: line.contains("~"),
+    };
+    normalize_progress_fields(&mut p, speed_bps);
+    Some(p)
+}
+
+/// Parse `--progress-template` lines:
+/// `[DMPROG]downloaded|total|estimate|speed|eta|percent`
+fn parse_dmprog_line(line: &str) -> Option<YoutubeProgress> {
+    let idx = line.find(DM_PROG_PREFIX)?;
+    let rest = line[idx + DM_PROG_PREFIX.len()..].trim();
+    let parts: Vec<&str> = rest.split('|').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let downloaded = parse_numeric_bytes(parts[0]).unwrap_or(0);
+    let total = parse_numeric_bytes(parts[1]).unwrap_or(0);
+    let estimate = parse_numeric_bytes(parts[2]).unwrap_or(0);
+    let is_estimate = total == 0 && estimate > 0;
+    let total_bytes = if total > 0 { total } else { estimate };
+    let speed_bps = parse_numeric_bytes(parts[3]).map(|b| b as f64).unwrap_or(0.0);
+    let eta_seconds = parse_eta_token(parts[4]);
+    let percent = {
+        let tok = parts[5].trim().trim_end_matches('%').trim();
+        tok.parse::<f64>().unwrap_or_else(|_| {
+            if total_bytes > 0 {
+                downloaded as f64 / total_bytes as f64 * 100.0
+            } else {
+                0.0
+            }
+        })
+    };
+
+    let mut p = YoutubeProgress {
+        percent,
+        downloaded_bytes: downloaded,
+        total_bytes,
+        speed_bps,
+        eta_seconds,
+        phase: "downloading".into(),
+        filename: None,
+        is_estimate,
+    };
+    normalize_progress_fields(&mut p, speed_bps);
+    Some(p)
+}
+
+fn parse_numeric_bytes(token: &str) -> Option<u64> {
+    let t = token.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("na") {
+        return None;
+    }
+    if let Ok(n) = t.parse::<u64>() {
+        return Some(n);
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        return Some(n as u64);
+    }
+    parse_size_token(t)
+}
+
+fn parse_eta_token(token: &str) -> Option<f64> {
+    let t = token.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("unknown") || t.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if let Ok(secs) = t.parse::<f64>() {
+        return Some(secs);
+    }
+    // HH:MM:SS or MM:SS
+    let parts: Vec<&str> = t.split(':').collect();
+    match parts.len() {
+        2 => {
+            let m: f64 = parts[0].parse().ok()?;
+            let s: f64 = parts[1].parse().ok()?;
+            Some(m * 60.0 + s)
+        }
+        3 => {
+            let h: f64 = parts[0].parse().ok()?;
+            let m: f64 = parts[1].parse().ok()?;
+            let s: f64 = parts[2].parse().ok()?;
+            Some(h * 3600.0 + m * 60.0 + s)
+        }
+        _ => None,
+    }
+}
+
+fn extract_size_after(line: &str, marker: &str) -> Option<u64> {
+    let idx = line.find(marker)?;
+    let rest = line[idx + marker.len()..].trim_start();
+    let rest = rest.trim_start_matches('~').trim_start();
+    let token = rest.split_whitespace().next()?;
+    parse_size_token(token)
+}
+
+fn extract_speed(line: &str) -> Option<f64> {
+    let idx = line.find(" at ")?;
+    let rest = line[idx + 4..].trim_start();
+    let token = rest.split_whitespace().next()?;
+    if token.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    parse_size_token(token.trim_end_matches("/s")).map(|b| b as f64)
+}
+
+fn extract_eta(line: &str) -> Option<f64> {
+    let idx = line.find(" ETA ")?;
+    let rest = line[idx + 5..].trim_start();
+    let token = rest.split_whitespace().next()?;
+    parse_eta_token(token)
+}
+
+fn parse_size_token(token: &str) -> Option<u64> {
+    let token = token.trim();
+    if token.is_empty() || token.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let mut num = String::new();
+    let mut unit = String::new();
+    for c in token.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+        } else {
+            unit.push(c);
+        }
+    }
+    let n: f64 = num.parse().ok()?;
+    let mult = match unit.to_ascii_lowercase().as_str() {
+        "b" | "" => 1.0,
+        "kb" | "kib" => 1024.0,
+        "mb" | "mib" => 1024.0 * 1024.0,
+        "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        _ => 1.0,
+    };
+    Some((n * mult) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_prefers_adaptive_not_mp4_only() {
+        let opts = YoutubeOptions {
+            quality: Some("1080".into()),
+            ..Default::default()
+        };
+        let sel = format_selector(&opts);
+        assert!(sel.contains("height=1080"), "{sel}");
+        assert!(sel.contains("height>=810"), "{sel}");
+        assert!(!sel.contains("[ext=mp4]"), "{sel}");
+        assert!(sel.starts_with("bv*"), "{sel}");
+        // Progressive `b` must not win before adaptive webm/AV1.
+        let b_pos = sel.find("/b[").or_else(|| sel.rfind("/b")).unwrap_or(usize::MAX);
+        let wv_pos = sel.find("wv*").unwrap_or(usize::MAX);
+        assert!(wv_pos < b_pos, "adaptive webm should precede progressive: {sel}");
+        let sort = format_sort(&opts).unwrap();
+        assert!(sort.contains("res:1080"), "{sort}");
+    }
+
+    #[test]
+    fn container_labels_are_not_raw_format_ids() {
+        let opts = YoutubeOptions {
+            quality: Some("720".into()),
+            format: Some("mp4".into()),
+            ..Default::default()
+        };
+        let sel = format_selector(&opts);
+        assert!(sel.contains("height<=720"), "{sel}");
+        assert_ne!(sel, "mp4");
+    }
+
+    #[test]
+    fn parses_quality_with_suffix() {
+        let opts = YoutubeOptions {
+            quality: Some("1080p HD".into()),
+            ..Default::default()
+        };
+        assert_eq!(parse_quality_height(&normalized_quality(&opts)), Some(1080));
+    }
+
+    #[test]
+    fn parses_dmprog_template_line() {
+        let line = "[DMPROG]1048576|10485760|NA|524288|15| 10.0%";
+        let p = parse_progress_line(line).unwrap();
+        assert_eq!(p.downloaded_bytes, 1_048_576);
+        assert_eq!(p.total_bytes, 10_485_760);
+        assert!((p.speed_bps - 524_288.0).abs() < 1.0);
+        assert_eq!(p.eta_seconds, Some(15.0));
+        assert!((p.percent - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn dash_progress_accumulates_video_then_audio() {
+        let mut acc = DashProgressAccum {
+            estimate_total: 900_000_000,
+            ..Default::default()
+        };
+        let v1 = apply_dash_progress(
+            &mut acc,
+            YoutubeProgress {
+                downloaded_bytes: 20_000_000,
+                total_bytes: 30_000_000,
+                speed_bps: 5_000_000.0,
+                percent: 66.0,
+                phase: "downloading".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(v1.downloaded_bytes, 20_000_000);
+        // Inflated estimate is replaced by live stream total.
+        assert_eq!(v1.total_bytes, 30_000_000);
+
+        let v2 = apply_dash_progress(
+            &mut acc,
+            YoutubeProgress {
+                downloaded_bytes: 30_000_000,
+                total_bytes: 30_000_000,
+                speed_bps: 5_000_000.0,
+                percent: 100.0,
+                phase: "downloading".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(v2.downloaded_bytes, 30_000_000);
+
+        // Audio stream starts — downloaded resets.
+        let a1 = apply_dash_progress(
+            &mut acc,
+            YoutubeProgress {
+                downloaded_bytes: 1_000_000,
+                total_bytes: 10_000_000,
+                speed_bps: 2_000_000.0,
+                percent: 10.0,
+                phase: "downloading".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(a1.downloaded_bytes, 31_000_000);
+        assert_eq!(a1.total_bytes, 40_000_000);
+    }
+
+    #[test]
+    fn detects_merge_errors() {
+        assert!(is_merge_or_ffmpeg_error(
+            "[Merger] ERROR: ffmpeg exited with code 1"
+        ));
+        assert!(!is_merge_or_ffmpeg_error("ERROR: Video unavailable"));
+    }
+}
