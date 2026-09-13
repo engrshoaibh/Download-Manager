@@ -1,2 +1,0 @@
-fn(State<Arc<tokio::sync::RwLock<DownloadManager>>>, axum::extract::Path<Uuid>) -> impl std::future::Future<Output = impl IntoResponse> {cancel_download}
-fn(State<Arc<tokio::sync::RwLock<DownloadManager>>>, axum::extract::Path<Uuid>) -> impl std::future::Future<Output = impl IntoResponse> {cancel_download}: Handler<_, _>
