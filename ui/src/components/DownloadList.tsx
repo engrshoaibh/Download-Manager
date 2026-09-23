@@ -214,7 +214,9 @@ const DownloadRow = memo(function DownloadRow({
             </div>
           )}
           <span className={`status-text ${job.status}`}>
-            {job.status === 'downloading' ? `${pct.toFixed(1)}%` : STATUS_LABELS[job.status]}
+            {job.status === 'downloading' 
+              ? (job.phase === 'merging' ? 'Merging...' : (pct >= 100 ? 'Finishing...' : `${pct.toFixed(1)}%`))
+              : STATUS_LABELS[job.status]}
           </span>
         </div>
       </span>

@@ -1089,11 +1089,11 @@ impl DownloadManager {
             return Err(e);
         }
 
-        /* Extension already sent title + size — skip slow yt-dlp probe (IDM-style handoff). */
-        let client_meta_ready = job.total_bytes > 0
-            && !job.filename.is_empty()
-            && !job.filename.eq_ignore_ascii_case("YouTube video.mp4")
-            && !job.filename.to_ascii_lowercase().starts_with("youtube_");
+        /* Force yt-dlp probe even if the extension sent a size hint. The browser 
+           extension only sniffs the Content-Length of a single stream (e.g. video), 
+           so its size is always missing the audio stream or inaccurate for playlists.
+           Probing guarantees we get the exact DASH format sizes. */
+        let client_meta_ready = false;
 
         if !client_meta_ready {
         match crate::youtube::probe(&job.url, &opts).await {
@@ -1195,7 +1195,22 @@ impl DownloadManager {
         }
 
         job.status = DownloadStatus::Downloading;
-        job.segments = vec![Segment::new(0, 0, job.total_bytes.saturating_sub(1))];
+        // Initialise N virtual segments so the UI shows parallel fragment progress.
+        // yt-dlp runs DEFAULT_CONCURRENT_FRAGMENTS workers internally (-N flag); we
+        // mirror that count so the progress bar looks like a true multi-connection
+        // download rather than a single block.
+        let yt_seg_n = job.segment_count.max(1);
+        let init_total = job.total_bytes;
+        job.segments = (0..yt_seg_n)
+            .map(|i| {
+                let start = if init_total > 0 { (init_total * i as u64) / yt_seg_n as u64 } else { 0 };
+                let end   = if init_total > 0 {
+                    if i == yt_seg_n - 1 { init_total.saturating_sub(1) }
+                    else { (init_total * (i as u64 + 1)) / yt_seg_n as u64 - 1 }
+                } else { 0 };
+                Segment::new(i, start, end)
+            })
+            .collect();
         update_state(mgr.clone(), job.clone()).await;
 
         let save_dir = PathBuf::from(&job.save_path)
@@ -1218,7 +1233,22 @@ impl DownloadManager {
             tokio::sync::mpsc::unbounded_channel::<crate::youtube::YoutubeProgress>();
         let mgr_prog_task = mgr.clone();
         let prog_job_id = job_id;
+        // yt_known_total = firm total at session start (from extension estimate or
+        // prior paused state). DMPROG reports the SUM of DASH component stream bytes
+        // (video + audio separately), which always exceeds the final merged container
+        // size. Pinning total_bytes to this cap prevents the 1.7 GB → 1.8 GB jump.
+        let yt_known_total = known_total;
+        // has_firm_total is true whenever we started with any size estimate.
+        let has_firm_total = yt_known_total.is_some();
         let progress_task = tokio::spawn(async move {
+            // Allow one backward movement of downloaded_bytes at the very start of
+            // a download/resume session. On resume, yt-dlp restarts its internal
+            // session counter from 0 before scanning cached fragments, so the first
+            // few progress reports can be lower than the paused downloaded_bytes.
+            // Without this flag the condition below would block those updates and the
+            // progress bar stays "stuck" until yt-dlp's counter catches up, then
+            // jumps. One backward update snaps to the real workdir state (< 250 ms).
+            let mut first_update = true;
             while let Some(progress) = prog_rx.recv().await {
                 let mut m = mgr_prog_task.write().await;
                 let Some(j) = m.jobs.get_mut(&prog_job_id) else {
@@ -1227,15 +1257,34 @@ impl DownloadManager {
                 if j.status != DownloadStatus::Downloading {
                     continue;
                 }
-                // Trust yt-dlp running totals (already DASH-accumulated).
+                // Let total_bytes grow if yt-dlp's actual DASH stream sizes exceed
+                // our initial probe estimate. DashProgressAccum already prevents
+                // wildly volatile jumps.
                 if progress.total_bytes > j.total_bytes {
                     j.total_bytes = progress.total_bytes;
                 }
-                if progress.downloaded_bytes >= j.downloaded_bytes {
+                // Update downloaded: allow one backward movement at session start
+                // so that on resume the display snaps to the true workdir bytes.
+                if progress.downloaded_bytes >= j.downloaded_bytes || first_update {
                     j.downloaded_bytes = progress.downloaded_bytes;
+                    first_update = false;
                 }
+                // If downloaded exceeds total (happens if total was an underestimate),
+                // push total up to match it so the progress bar stays at 100%.
                 if j.total_bytes > 0 && j.downloaded_bytes > j.total_bytes {
                     j.total_bytes = j.downloaded_bytes;
+                }
+
+                // Temporary debug log so we can watch sizes in the terminal
+                if progress.percent > 0.0 {
+                    tracing::info!(
+                        "YT Progress: phase={}, in_dl={}, in_tot={}, j_dl={}, j_tot={}",
+                        progress.phase,
+                        progress.downloaded_bytes,
+                        progress.total_bytes,
+                        j.downloaded_bytes,
+                        j.total_bytes
+                    );
                 }
 
                 if progress.speed_bps > 1.0 {
@@ -1256,28 +1305,64 @@ impl DownloadManager {
                     j.eta_seconds = Some(eta);
                 }
 
-                if j.segments.is_empty() {
+                if !progress.phase.is_empty() {
+                    j.phase = Some(progress.phase.clone());
+                }
+
+                // Distribute downloaded bytes evenly across N virtual segments so
+                // the UI shows a multi-connection progress bar matching yt-dlp's
+                // internal -N concurrent fragment workers.
+                let total = j.total_bytes;
+                let downloaded = j.downloaded_bytes;
+                let n = j.segment_count.max(1);
+                let per_seg_speed = if n > 0 { j.speed_bps / n as f64 } else { j.speed_bps };
+                if total > 0 && n > 1 {
+                    let per_seg_bytes = (downloaded / n as u64).min(total / n as u64);
+                    let remainder = downloaded.saturating_sub(per_seg_bytes * n as u64);
+                    j.segments = (0..n)
+                        .map(|i| {
+                            let start = (total * i as u64) / n as u64;
+                            let end = if i == n - 1 {
+                                total.saturating_sub(1)
+                            } else {
+                                (total * (i as u64 + 1)) / n as u64 - 1
+                            };
+                            let seg_size = end.saturating_sub(start) + 1;
+                            // Last segment absorbs the remainder so sum == downloaded.
+                            let seg_dl = if i == n - 1 {
+                                (per_seg_bytes + remainder).min(seg_size)
+                            } else {
+                                per_seg_bytes.min(seg_size)
+                            };
+                            Segment { id: i, start, end, downloaded: seg_dl, speed_bps: per_seg_speed }
+                        })
+                        .collect();
+                } else if j.segments.is_empty() {
                     j.segments
-                        .push(Segment::new(0, 0, j.total_bytes.saturating_sub(1)));
+                        .push(Segment::new(0, 0, total.saturating_sub(1)));
                 } else {
-                    j.segments[0].end = j.total_bytes.saturating_sub(1);
+                    j.segments[0].end = total.saturating_sub(1);
                     let span = j.segments[0]
                         .end
                         .saturating_sub(j.segments[0].start)
                         .saturating_add(1);
-                    j.segments[0].downloaded = j.downloaded_bytes.min(span);
+                    j.segments[0].downloaded = downloaded.min(span);
                     j.segments[0].speed_bps = j.speed_bps;
                 }
+
                 let snapshot = j.clone();
                 m.events.send(DmEvent::JobUpdated {
                     job: snapshot.clone(),
                 });
-                m.events.send(DmEvent::SegmentProgress {
-                    job_id: prog_job_id,
-                    segment_id: 0,
-                    downloaded: snapshot.downloaded_bytes,
-                    speed_bps: snapshot.speed_bps,
-                });
+                // Emit per-segment progress for each virtual segment.
+                for seg in &snapshot.segments {
+                    m.events.send(DmEvent::SegmentProgress {
+                        job_id: prog_job_id,
+                        segment_id: seg.id,
+                        downloaded: seg.downloaded,
+                        speed_bps: seg.speed_bps,
+                    });
+                }
             }
         });
 

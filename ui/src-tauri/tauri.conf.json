@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ui",
+  "productName": "Download Manager Pro",
   "version": "0.1.0",
   "identifier": "com.highperf.dm",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Download Manager",
+        "title": "Download Manager Pro",
         "width": 1200,
         "height": 760,
         "minWidth": 900,
@@ -21,6 +21,9 @@
     ],
     "security": {
       "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.ico"
     }
   },
   "bundle": {

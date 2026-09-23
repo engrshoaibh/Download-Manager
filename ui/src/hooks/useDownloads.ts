@@ -23,6 +23,7 @@ export interface DownloadJob {
   downloaded_bytes: number
   segments: Segment[]
   status: DownloadStatus
+  phase?: string | null
   speed_bps: number
   eta_seconds: number | null
   created_at: string
@@ -369,6 +370,16 @@ export function useDownloads() {
     await Promise.all(ids.map(id => pauseDownload(id).catch(() => undefined)))
   }
 
+  async function triggerUpdate() {
+    await fetch(`${DAEMON_URL}/update`, { method: 'POST' })
+  }
+
+  async function getUpdateStatus(): Promise<{ state: string; version?: string; message?: string }> {
+    const resp = await fetch(`${DAEMON_URL}/update/status`)
+    if (!resp.ok) throw new Error('Failed to fetch update status')
+    return await resp.json()
+  }
+
   return {
     jobs: Array.from(jobs.values()),
     connected: connection === 'connected',
@@ -378,5 +389,7 @@ export function useDownloads() {
     pauseDownload,
     resumeDownload,
     stopAll,
+    triggerUpdate,
+    getUpdateStatus,
   }
 }

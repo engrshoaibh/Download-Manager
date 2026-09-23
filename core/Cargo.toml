@@ -2,7 +2,7 @@
 name = "dm-core"
 version = "0.1.0"
 edition = "2021"
-description = "High-Performance Download Manager Core Engine"
+description = "High-Performance Download Manager Pro Core Engine"
 
 [[bin]]
 name = "dm-daemon"
@@ -58,6 +58,9 @@ thiserror = "1"
 
 # URL parsing
 url = "2"
+
+# Lazy static for updater global state
+lazy_static = "1.4"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

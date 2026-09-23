@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { DownloadList } from './components/DownloadList'
@@ -30,7 +31,7 @@ function readDefaultSegments(): number {
 }
 
 export default function App() {
-  const { jobs, connected, connection, addDownload, cancelDownload, pauseDownload, resumeDownload, stopAll } = useDownloads()
+  const { jobs, connected, connection, addDownload, cancelDownload, pauseDownload, resumeDownload, stopAll, triggerUpdate, getUpdateStatus } = useDownloads()
   const [showAdd, setShowAdd] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
@@ -41,8 +42,13 @@ export default function App() {
   const [openMenu, setOpenMenu] = useState<MenuId>(null)
   const [defaultSegments, setDefaultSegments] = useState(readDefaultSegments)
   const [showProgressId, setShowProgressId] = useState<string | null>(null)
+  const [updateStatus, setUpdateStatus] = useState<{ state: string; version?: string; message?: string } | null>(null)
   const menuRef = useRef<HTMLElement>(null)
   const lastClicked = useRef<string | null>(null)
+
+  useEffect(() => {
+    invoke('setup_native_messaging').catch(console.error)
+  }, [])
 
   const activeJobs = jobs.filter(j => j.status === 'downloading' || j.status === 'probing')
   const completedJobs = jobs.filter(j => j.status === 'completed')
@@ -184,6 +190,25 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [selectedIds, selectedJobs])
 
+  useEffect(() => {
+    let timer: any
+    async function check() {
+      try {
+        const status = await getUpdateStatus()
+        setUpdateStatus(status)
+        if (status.state === 'checking' || status.state === 'downloading') {
+          timer = setTimeout(check, 2000)
+        } else {
+          timer = setTimeout(check, 60000)
+        }
+      } catch {
+        timer = setTimeout(check, 60000)
+      }
+    }
+    check()
+    return () => clearTimeout(timer)
+  }, [getUpdateStatus])
+
   function saveDefaultSegments(n: number) {
     setDefaultSegments(n)
     localStorage.setItem(DEFAULT_SEGMENTS_KEY, String(n))
@@ -212,6 +237,23 @@ export default function App() {
         </div>
       )}
 
+      {connection === 'connected' && updateStatus && updateStatus.state !== 'up_to_date' && (
+        <div
+          className={`daemon-banner ${updateStatus.state === 'error' ? 'disconnected' : 'reconnecting'}`}
+          role="status"
+          style={{ backgroundColor: updateStatus.state === 'ready_to_restart' ? '#2e7d32' : undefined }}
+        >
+          <span className="daemon-banner-dot" />
+          {updateStatus.state === 'checking' && 'Checking for updates...'}
+          {updateStatus.state === 'downloading' && `Downloading update ${updateStatus.version || ''}...`}
+          {updateStatus.state === 'ready_to_restart' && 'Update ready! Please restart the daemon to apply.'}
+          {updateStatus.state === 'error' && `Update failed: ${updateStatus.message || 'Unknown error'}`}
+          {updateStatus.state === 'error' && (
+            <button className="btn btn-ghost btn-sm" style={{ marginLeft: '12px', padding: '2px 8px', fontSize: '11px', height: 'auto', minHeight: '20px' }} onClick={() => void triggerUpdate()}>Retry</button>
+          )}
+        </div>
+      )}
+
       <nav className="menubar" ref={menuRef} aria-label="Application menu">
         {([
           ['file', 'File', [
@@ -227,7 +269,8 @@ export default function App() {
           ]],
           ['view', 'View', []],
           ['help', 'Help', [
-            ['About Download Manager', () => setShowAbout(true)],
+            ['Check for Updates', () => { void triggerUpdate() }],
+            ['About Download Manager Pro', () => setShowAbout(true)],
           ]],
         ] as [MenuId, string, [string, () => void, boolean?][]][]).map(([id, label, items]) => (
           <div key={id} className="menu">
@@ -386,7 +429,7 @@ export default function App() {
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowAbout(false)}>
           <div className="modal modal-sm" role="dialog" aria-modal="true" aria-labelledby="about-title">
             <div className="modal-header">
-              <h2 className="modal-title" id="about-title">Download Manager</h2>
+              <h2 className="modal-title" id="about-title">Download Manager Pro</h2>
               <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setShowAbout(false)} aria-label="Close">✕</button>
             </div>
             <p className="about-copy">

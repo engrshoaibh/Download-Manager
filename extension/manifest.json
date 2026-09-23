@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Download Manager Integration",
+  "name": "Download Manager Pro Integration",
   "short_name": "DM Capture",
   "version": "1.6.2",
   "description": "IDM-style sniffer — direct googlevideo streams with segmented downloads, YouTube quality menu, daemon capture.",
@@ -15,7 +15,7 @@
       "16": "icons/icon16.png",
       "48": "icons/icon48.png"
     },
-    "default_title": "Download Manager"
+    "default_title": "Download Manager Pro"
   },
   "background": {
     "service_worker": "background/service-worker.js",

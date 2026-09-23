@@ -6,7 +6,7 @@ export function DownloadProgressDialog({ jobId, onClose }: { jobId?: string, onC
   const searchParams = new URLSearchParams(window.location.search)
   const id = jobId || searchParams.get('id')
   
-  const { jobs, pauseDownload, resumeDownload, cancelDownload } = useDownloads()
+  const { jobs, pauseDownload, resumeDownload } = useDownloads()
   const job = jobs.find(j => j.id === id)
 
   if (!job) {
@@ -30,8 +30,7 @@ export function DownloadProgressDialog({ jobId, onClose }: { jobId?: string, onC
     }
   }
 
-  const handleCancel = () => {
-    void cancelDownload(job.id, false)
+  const handleClose = () => {
     if (onClose) onClose()
     else window.close()
   }
@@ -106,7 +105,11 @@ export function DownloadProgressDialog({ jobId, onClose }: { jobId?: string, onC
                 </span>
               )}
             </div>
-            <span style={{ color: isActive ? '#f57c00' : 'inherit' }}>{Math.min(pct, 100).toFixed(2)}%</span>
+            <span style={{ color: isActive ? '#f57c00' : 'inherit' }}>
+              {job.phase === 'merging' 
+                ? 'Merging...' 
+                : (isActive && pct >= 100 ? 'Finishing...' : `${Math.min(pct, 100).toFixed(2)}%`)}
+            </span>
           </div>
           
           <div style={{ width: '100%', height: '24px', backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: '4px', overflow: 'hidden', position: 'relative', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.2)' }}>
@@ -137,7 +140,7 @@ export function DownloadProgressDialog({ jobId, onClose }: { jobId?: string, onC
         <button className="btn btn-primary" onClick={handlePauseResume} disabled={job.status === 'completed'} style={{ minWidth: '80px', backgroundColor: '#f57c00', color: 'white', border: 'none' }}>
           {isActive ? 'Pause' : 'Resume'}
         </button>
-        <button className="btn btn-ghost" onClick={handleCancel} style={{ minWidth: '80px' }}>Cancel</button>
+        <button className="btn btn-ghost" onClick={handleClose} style={{ minWidth: '80px' }}>Close</button>
       </div>
     </div>
   )

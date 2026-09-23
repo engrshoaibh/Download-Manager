@@ -283,3 +283,17 @@ fn spawn_job(
         }
     });
 }
+
+pub async fn get_update_status() -> impl IntoResponse {
+    Json(crate::updater::get_status())
+}
+
+pub async fn trigger_update() -> impl IntoResponse {
+    // Fire and forget since the update takes a while and we don't want to block the HTTP response
+    tokio::spawn(async move {
+        if let Err(e) = crate::updater::check_and_apply_update().await {
+            tracing::error!("Manual update trigger failed: {}", e);
+        }
+    });
+    StatusCode::ACCEPTED.into_response()
+}

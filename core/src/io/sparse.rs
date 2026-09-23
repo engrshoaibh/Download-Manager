@@ -90,6 +90,7 @@ impl PartMetadata {
             downloaded_bytes,
             segments: self.segments,
             status: DownloadStatus::Paused,
+            phase: None,
             speed_bps: 0.0,
             eta_seconds: None,
             created_at: self.updated_at,

@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use dm_core::{api, engine, io, network, persist, settings, youtube, DownloadManager};
+use dm_core::{api, engine, io, network, persist, settings, youtube, updater, DownloadManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,6 +13,8 @@ async fn main() -> Result<()> {
 
     info!("🚀 DM Daemon starting on 127.0.0.1:7373");
     info!("Job state: {}", persist::state_path().display());
+
+    updater::cleanup_bak();
 
     let tools = youtube::verify_tools_at_startup().await;
     match tools.status.as_str() {
@@ -32,6 +34,7 @@ async fn main() -> Result<()> {
     }
 
     youtube::spawn_ytdlp_update_scheduler(youtube::YTDLP_UPDATE_INTERVAL);
+    updater::spawn_auto_updater(std::time::Duration::from_secs(24 * 3600));
 
     let manager = DownloadManager::load_or_new();
     let manager = std::sync::Arc::new(tokio::sync::RwLock::new(manager));

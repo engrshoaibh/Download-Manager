@@ -1333,12 +1333,15 @@ async fn download_once(
                             last_part_instant = std::time::Instant::now();
                         }
                         
-                        // FFmpeg merge phase creates a duplicate output file alongside the inputs.
-                        // Summing the workdir during this phase inflates the size by 2x, causing UI glitches.
-                        if last_progress.phase != "merging" {
-                            last_progress.downloaded_bytes =
-                                part_bytes.max(last_progress.downloaded_bytes);
-                        }
+                        // NOTE: workdir bytes (sum of all files in the hidden job dir)
+                        // are intentionally NOT used to update downloaded_bytes here.
+                        // For playlists, completed episode .mp4 files remain in the
+                        // workdir and their cumulative size inflates the counter to
+                        // 100 % long before the download is done.
+                        // DashProgressAccum (via apply_dash_progress) already handles
+                        // stream-to-stream transitions (video → audio, episode N → N+1)
+                        // through its finished_bytes accumulator, so it is the sole
+                        // authoritative source for downloaded_bytes.
 
                         last_progress.total_bytes = reconcile_yt_total(
                             &stream_acc,
@@ -1377,9 +1380,7 @@ async fn download_once(
                         }
                         if let Some(p) = parsed {
                             let mut merged = apply_dash_progress(&mut stream_acc, p);
-                            if last_part_bytes > merged.downloaded_bytes {
-                                merged.downloaded_bytes = last_part_bytes;
-                            }
+
                             if merged.speed_bps <= 1.0 && last_progress.speed_bps > 1.0 {
                                 merged.speed_bps = last_progress.speed_bps;
                             }
@@ -1411,9 +1412,7 @@ async fn download_once(
                         if t.is_empty() { continue; }
                         if let Some(p) = parse_progress_line(t) {
                             let mut merged = apply_dash_progress(&mut stream_acc, p);
-                            if last_part_bytes > merged.downloaded_bytes {
-                                merged.downloaded_bytes = last_part_bytes;
-                            }
+
                             let speed = merged.speed_bps;
                             normalize_progress_fields(&mut merged, speed);
                             last_progress = merged;
@@ -1443,7 +1442,7 @@ async fn download_once(
         push_stderr_tail(&mut stderr_tail, &line);
         if let Some(p) = parse_progress_line(&line) {
             let mut merged = apply_dash_progress(&mut stream_acc, p);
-            merged.downloaded_bytes = merged.downloaded_bytes.max(last_part_bytes);
+
             let speed = merged.speed_bps;
             normalize_progress_fields(&mut merged, speed);
             last_progress = merged;
@@ -1586,8 +1585,11 @@ struct DashProgressAccum {
 
 fn apply_dash_progress(acc: &mut DashProgressAccum, mut p: YoutubeProgress) -> YoutubeProgress {
     // New stream: yt-dlp resets downloaded near zero after finishing video/audio.
+    // yt-dlp concurrent fragments (-N) can cause downloaded_bytes to briefly fluctuate
+    // backwards by several megabytes. We must only trigger a stream transition when
+    // downloaded_bytes drops massively (e.g. back to near zero).
     if acc.last_stream_downloaded > 256 * 1024
-        && p.downloaded_bytes + 256 * 1024 < acc.last_stream_downloaded
+        && p.downloaded_bytes < acc.last_stream_downloaded / 2
     {
         acc.finished_bytes = acc
             .finished_bytes
@@ -1597,7 +1599,11 @@ fn apply_dash_progress(acc: &mut DashProgressAccum, mut p: YoutubeProgress) -> Y
     if p.total_bytes > 0 {
         acc.current_stream_total = p.total_bytes;
     }
-    acc.last_stream_downloaded = p.downloaded_bytes;
+    // Only update last_stream_downloaded if it didn't fluctuate backwards, 
+    // or if we just reset it for a new stream.
+    if p.downloaded_bytes > acc.last_stream_downloaded || p.downloaded_bytes < acc.last_stream_downloaded / 2 {
+        acc.last_stream_downloaded = p.downloaded_bytes;
+    }
 
     let combined_dl = acc.finished_bytes.saturating_add(p.downloaded_bytes);
     let live_total = if acc.current_stream_total > 0 {
@@ -1630,6 +1636,17 @@ fn reconcile_yt_total(acc: &DashProgressAccum, live_total: u64, downloaded: u64,
         && acc.estimate_total > live.saturating_mul(2).max(live + 8 * 1024 * 1024)
     {
         return live;
+    }
+    // The sum of separate DASH component streams (video + audio) can slightly exceed
+    // the final merged container size due to muxing overhead differences. On
+    // pause/resume the estimate_total comes from the actual merged file size, so when
+    // `live` only marginally exceeds it (< 32 MiB) the estimate is more accurate.
+    // Genuine large underestimates (> 32 MiB over) are still allowed to grow.
+    if acc.estimate_total > 0
+        && live > acc.estimate_total
+        && live.saturating_sub(acc.estimate_total) < 32 * 1024 * 1024
+    {
+        return acc.estimate_total.max(downloaded);
     }
     acc.estimate_total.max(live)
 }

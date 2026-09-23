@@ -60,6 +60,8 @@ pub struct DownloadJob {
     pub downloaded_bytes: u64,
     pub segments: Vec<Segment>,
     pub status: DownloadStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub speed_bps: f64,
     pub eta_seconds: Option<f64>,
     pub created_at: DateTime<Utc>,
@@ -100,6 +102,7 @@ impl DownloadJob {
             downloaded_bytes: 0,
             segments: Vec::new(),
             status: DownloadStatus::Queued,
+            phase: None,
             speed_bps: 0.0,
             eta_seconds: None,
             created_at: Utc::now(),

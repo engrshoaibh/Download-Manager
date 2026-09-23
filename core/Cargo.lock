@@ -1067,6 +1067,7 @@ dependencies = [
  "dirs",
  "fs4",
  "futures-util",
+ "lazy_static",
  "memmap2",
  "parking_lot 0.12.5",
  "quinn",
