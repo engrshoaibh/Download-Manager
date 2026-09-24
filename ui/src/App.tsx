@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { join } from '@tauri-apps/api/path'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { DownloadList } from './components/DownloadList'
@@ -99,8 +100,8 @@ export default function App() {
       }
       setContextMenu(null)
     }
-    document.addEventListener('mousedown', onDocClick)
-    return () => document.removeEventListener('mousedown', onDocClick)
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
   }, [])
 
   const handleSelect = useCallback((id: string, e: ReactMouseEvent) => {
@@ -161,6 +162,26 @@ export default function App() {
   async function handleProperties() {
     if (!primaryJob) return
     setShowProgressId(primaryJob.id)
+  }
+
+  async function handleOpenFile() {
+    if (!primaryJob) return
+    try {
+      const fullPath = await join(primaryJob.save_path, primaryJob.filename)
+      await invoke('open_file', { path: fullPath })
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  async function handleOpenFolder() {
+    if (!primaryJob) return
+    try {
+      const fullPath = await join(primaryJob.save_path, primaryJob.filename)
+      await invoke('open_folder', { path: fullPath })
+    } catch (e) {
+      console.error(e)
+    }
   }
 
   useEffect(() => {
@@ -261,6 +282,8 @@ export default function App() {
             ['Options…', () => setShowSettings(true)],
           ]],
           ['downloads', 'Downloads', [
+            ['Open File', () => { void handleOpenFile() }, !primaryJob || primaryJob.status !== 'completed'],
+            ['Open Folder', () => { void handleOpenFolder() }, !primaryJob],
             ['Properties', () => { void handleProperties() }, !primaryJob],
             ['Resume', resumeSelected, !canResume],
             ['Stop', stopSelected, !canStop],
@@ -464,6 +487,8 @@ export default function App() {
           }}
           onClick={(e) => e.stopPropagation()}
         >
+          <button className="menu-item" onClick={() => { setContextMenu(null); void handleOpenFile(); }} disabled={!primaryJob || primaryJob.status !== 'completed'}>Open File</button>
+          <button className="menu-item" onClick={() => { setContextMenu(null); void handleOpenFolder(); }} disabled={!primaryJob}>Open Folder</button>
           <button className="menu-item" onClick={() => { setContextMenu(null); void handleProperties(); }} disabled={!primaryJob}>Properties</button>
           <button className="menu-item" onClick={() => { setContextMenu(null); resumeSelected(); }} disabled={!canResume}>Resume</button>
           <button className="menu-item" onClick={() => { setContextMenu(null); stopSelected(); }} disabled={!canStop}>Stop</button>

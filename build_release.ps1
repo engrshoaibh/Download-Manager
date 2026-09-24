@@ -14,6 +14,10 @@ Write-Host "Copying core binaries..."
 Copy-Item ".\target\release\dm-daemon.exe" -Destination $ReleaseDir -Force
 Copy-Item ".\target\release\dm-native-host.exe" -Destination $ReleaseDir -Force
 
+Write-Host "Copying core binaries to Tauri app for bundling..."
+Copy-Item ".\target\release\dm-daemon.exe" -Destination "$PSScriptRoot\ui\src-tauri\" -Force
+Copy-Item ".\target\release\dm-native-host.exe" -Destination "$PSScriptRoot\ui\src-tauri\" -Force
+
 Write-Host "Building Tauri UI (Release)..."
 Set-Location "$PSScriptRoot\ui"
 npm install

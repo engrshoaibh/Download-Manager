@@ -335,11 +335,21 @@ async fn verify_executable(path: &Path, label: &str) -> Result<()> {
     } else {
         "--version"
     };
-    let mut cmd = Command::new(path);
-    cmd.arg(arg)
+    
+    let mut std_cmd = std::process::Command::new(path);
+    std_cmd.arg(arg)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
+        
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(0x08000000);
+    }
+    
+    let mut cmd = Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+    
     match tokio::time::timeout(Duration::from_secs(8), cmd.status()).await {
         Ok(Ok(status)) if status.success() => Ok(()),
         Ok(Ok(status)) => bail!("{label} exited with {status} during version check"),
@@ -523,9 +533,12 @@ fn find_ffmpeg() -> Option<PathBuf> {
 fn which(name: &str) -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        let output = std::process::Command::new("where")
-            .arg(name)
-            .output()
+        let mut std_cmd = std::process::Command::new("where");
+        std_cmd.arg(name);
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(0x08000000);
+        
+        let output = std_cmd.output()
             .context("where failed")?;
         if !output.status.success() {
             bail!("not found");
@@ -696,16 +709,21 @@ pub async fn probe(url: &str, opts: &YoutubeOptions) -> Result<YoutubeInfo> {
             None
         };
 
-        let mut cmd = Command::new(&ytdlp);
-        cmd.arg("-J")
+        let mut std_cmd = std::process::Command::new(&ytdlp);
+        std_cmd.arg("-J")
             .arg("--no-playlist")
             .arg("--no-warnings")
-            // Do NOT force player_client=web/android — that collapses the
-            // adaptive ladder to progressive ~360p. yt-dlp's default clients
-            // return the full format list (including 4K webm/AV1).
             .arg(&target)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+            
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(0x08000000);
+        }
+        
+        let mut cmd = Command::from(std_cmd);
 
         if let Some(ref ua) = opts.user_agent {
             if !ua.trim().is_empty() {
