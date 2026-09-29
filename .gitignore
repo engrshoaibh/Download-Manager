@@ -12,6 +12,8 @@ yarn-debug.log*
 yarn-error.log*
 *.log
 
+updater_keys
+updater_keys.pub
 # Rust / Cargo
 core/target/
 ui/src-tauri/target/

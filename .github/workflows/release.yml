@@ -33,6 +33,9 @@ jobs:
       - name: Run Build Script
         run: .\build_release.ps1
         shell: powershell
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2

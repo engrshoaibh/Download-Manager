@@ -37,5 +37,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU1Nzk0REYyQUMwOENFMjUKUldRbHpnaXM4azE1NVd1dWxoTGg4RVZPZURXeC9vem50STVjdUxmUUxnellJRjk1cklJeTVveW4K",
+      "endpoints": [
+        "https://github.com/engrshoaibh/Download-Manager/releases/latest/download/updater.json"
+      ]
+    }
   }
 }
