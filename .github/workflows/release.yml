@@ -9,6 +9,8 @@ on:
 jobs:
   build-and-release:
     name: Build and Release
+    permissions:
+      contents: write
     runs-on: windows-latest
     
     steps:

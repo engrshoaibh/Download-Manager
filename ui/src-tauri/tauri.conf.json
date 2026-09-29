@@ -26,6 +26,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Shoaib Hassan",
     "resources": [
       "dm-daemon.exe",
       "dm-native-host.exe"

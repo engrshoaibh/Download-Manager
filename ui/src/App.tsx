@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import packageJson from '../package.json'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { DownloadList } from './components/DownloadList'
@@ -458,9 +459,13 @@ export default function App() {
               <button className="btn btn-ghost btn-sm btn-icon" onClick={() => setShowAbout(false)} aria-label="Close">✕</button>
             </div>
             <p className="about-copy">
-              A high-performance download manager with parallel segments, HTTP/3, and zero-copy I/O.
-              Double-click a download (or use Properties) for the IDM-style progress dialog.
+              A fast and reliable download manager.
+              Double-click a download (or use Properties) for detailed progress.
             </p>
+            <div className="about-info" style={{ marginTop: '1rem', fontSize: '0.85em', color: 'var(--text-muted)' }}>
+              <p>Version: {packageJson.version}</p>
+              <p>Publisher: Shoaib Hassan</p>
+            </div>
             <div className="modal-footer">
               <button className="btn btn-primary" onClick={() => setShowAbout(false)}>OK</button>
             </div>
