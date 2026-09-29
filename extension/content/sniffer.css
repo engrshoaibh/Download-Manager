@@ -1,43 +1,60 @@
 /* IDM-style video download banner + media grabber + toast */
 
-/* ── Video banner (IDM-like overlay on players) ─────────────── */
+/* ── Video banner (IDM: top-right of player chrome) ─────────── */
 
 .dm-vb-host {
   position: relative !important;
+  overflow: visible !important;
 }
 
 .dm-video-banner {
   position: absolute;
-  top: 8px;
-  right: 8px;
+  top: 2px;
+  right: 2px;
+  left: auto;
   z-index: 2147483645;
-  font: 12px/1.2 system-ui, "Segoe UI", sans-serif;
+  font: 12px/1.2 "Segoe UI", Tahoma, sans-serif;
   pointer-events: auto;
+}
+
+/* Prefer sitting just above the player when there is clear space */
+.dm-video-banner.dm-vb-above {
+  top: 0;
+  right: 0;
+  transform: translateY(-100%);
 }
 
 .dm-video-banner.dm-vb-hidden {
   display: none !important;
 }
 
+.dm-vb-bar {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid #8a96a8;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #f3f6fa 0%, #dce3ec 100%);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 .dm-vb-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.25);
-  border-radius: 3px;
-  background: linear-gradient(180deg, #f4f6f8 0%, #d9dee5 100%);
-  color: #1a1d24;
+  border: 0;
+  background: transparent;
+  color: #1a2330;
   font: inherit;
-  font-weight: 650;
-  padding: 5px 9px 5px 7px;
+  font-weight: 600;
+  padding: 4px 8px 4px 5px;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-  white-space: nowrap;
-  max-width: min(240px, 70vw);
+  max-width: min(220px, 70vw);
 }
 
 .dm-vb-btn:hover {
-  background: linear-gradient(180deg, #fff 0%, #e8edf3 100%);
+  background: rgba(255, 255, 255, 0.45);
 }
 
 .dm-vb-btn.dm-vb-loading {
@@ -49,39 +66,60 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 3px;
-  background: #e87722;
+  width: 16px;
+  height: 16px;
+  border-radius: 2px;
+  background: #2ea44f;
   color: #fff;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 800;
   flex-shrink: 0;
+  line-height: 1;
 }
 
 .dm-vb-text {
   overflow: hidden;
   text-overflow: ellipsis;
+  color: #152033;
 }
 
-.dm-vb-caret {
-  color: #5b6472;
-  font-size: 10px;
+.dm-vb-actions {
+  display: inline-flex;
+  align-items: stretch;
+  border-left: 1px solid #a8b2c0;
 }
 
-/* Resolution dropdown — IDM-style title + detail lines */
+.dm-vb-action {
+  border: 0;
+  background: transparent;
+  color: #4a5568;
+  font: 11px/1 "Segoe UI", Tahoma, sans-serif;
+  padding: 0 7px;
+  cursor: pointer;
+  min-width: 22px;
+}
+
+.dm-vb-action:hover {
+  background: rgba(255, 255, 255, 0.5);
+  color: #111827;
+}
+
+/* Resolution dropdown — opens under the top-right bar */
 .dm-res-menu {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  min-width: 320px;
-  max-width: min(420px, 92vw);
+  left: auto;
+  min-width: 380px;
+  max-width: min(520px, 94vw);
+  max-height: min(480px, 70vh);
   background: #1e2128;
   color: #e8eaef;
   border: 1px solid #3d4452;
   border-radius: 6px;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
   overflow: hidden;
+  transform: none;
 }
 
 .dm-res-menu.dm-res-up {
@@ -104,7 +142,7 @@
   list-style: none;
   margin: 0;
   padding: 4px;
-  max-height: 320px;
+  max-height: 420px;
   overflow-y: auto;
 }
 
@@ -120,7 +158,7 @@
   color: inherit;
   font: inherit;
   text-align: left;
-  padding: 9px 12px;
+  padding: 8px 10px;
   cursor: pointer;
 }
 
@@ -129,8 +167,8 @@
 }
 
 .dm-res-item.dm-res-best .dm-res-label::after {
-  content: "BEST";
-  margin-left: 8px;
+  content: " BEST";
+  margin-left: 6px;
   font-size: 9px;
   font-weight: 800;
   color: #e87722;
@@ -139,13 +177,13 @@
 }
 
 .dm-res-label {
-  font-weight: 700;
-  font-size: 13px;
+  font-weight: 500;
+  font-size: 12px;
+  line-height: 1.35;
   color: #e8eaef;
   max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .dm-res-meta {

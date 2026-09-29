@@ -58,6 +58,79 @@ const DAEMON_URL = 'http://127.0.0.1:7373'
 const WS_URL = 'ws://127.0.0.1:7373/ws'
 const RECONNECT_MS = 3000
 
+/** Client-only fields used to derive speed from how fast Done grows. */
+type SpeedSample = {
+  __speedAt?: number
+  __speedBytes?: number
+  __speedEma?: number
+}
+
+type JobState = DownloadJob & SpeedSample
+
+/**
+ * Speed must match Done. Checkpoints wipe per-segment speeds to 0, so summing
+ * them often shows one connection (~50 KB/s) while all 16 are writing.
+ * Measure from downloaded_bytes over wall time instead.
+ */
+function withMeasuredSpeed(prev: JobState | undefined, job: JobState, now = performance.now()): JobState {
+  if (job.status !== 'downloading') {
+    return {
+      ...job,
+      speed_bps: job.status === 'probing' ? job.speed_bps : 0,
+      __speedAt: now,
+      __speedBytes: job.downloaded_bytes,
+      __speedEma: 0,
+    }
+  }
+
+  const prevAt = prev?.__speedAt
+  const prevBytes = prev?.__speedBytes ?? prev?.downloaded_bytes ?? job.downloaded_bytes
+  let ema = prev?.__speedEma ?? 0
+
+  if (prevAt != null) {
+    const dt = (now - prevAt) / 1000
+    if (dt >= 0.2) {
+      const delta = Math.max(0, job.downloaded_bytes - prevBytes)
+      const instant = delta / dt
+      ema = ema > 0 ? ema * 0.55 + instant * 0.45 : instant
+      const speed_bps = ema > 1 ? ema : job.speed_bps
+      const eta_seconds =
+        speed_bps > 1 && job.total_bytes > job.downloaded_bytes
+          ? (job.total_bytes - job.downloaded_bytes) / speed_bps
+          : job.eta_seconds
+      return {
+        ...job,
+        speed_bps,
+        eta_seconds,
+        __speedAt: now,
+        __speedBytes: job.downloaded_bytes,
+        __speedEma: ema,
+      }
+    }
+    /* Same animation frame / burst — keep the EMA, don't reset the byte anchor. */
+    const speed_bps = ema > 1 ? ema : job.speed_bps || prev?.speed_bps || 0
+    const eta_seconds =
+      speed_bps > 1 && job.total_bytes > job.downloaded_bytes
+        ? (job.total_bytes - job.downloaded_bytes) / speed_bps
+        : job.eta_seconds
+    return {
+      ...job,
+      speed_bps,
+      eta_seconds,
+      __speedAt: prevAt,
+      __speedBytes: prevBytes,
+      __speedEma: ema,
+    }
+  }
+
+  return {
+    ...job,
+    __speedAt: now,
+    __speedBytes: job.downloaded_bytes,
+    __speedEma: job.speed_bps > 0 ? job.speed_bps : 0,
+  }
+}
+
 /** Pure reducer so buffered WS events can be replayed in seq order. */
 export function applyJobEvent(
   prev: Map<string, DownloadJob>,
@@ -71,32 +144,37 @@ export function applyJobEvent(
       next.set(event.job.id, event.job)
       break
     case 'job_updated': {
-      const existing = next.get(event.job.id)
-      const job = { ...event.job }
+      const existing = next.get(event.job.id) as JobState | undefined
+      const job = { ...event.job } as JobState
       if (
         existing &&
         (job.status === 'downloading' || job.status === 'probing')
       ) {
-        // Keep last good speed when a tick reports 0 / Unknown.
-        if (job.status === 'downloading' && (!job.speed_bps || job.speed_bps <= 0) && existing.speed_bps > 0) {
-          job.speed_bps = existing.speed_bps
-          if ((!job.eta_seconds || job.eta_seconds <= 0) && job.total_bytes > job.downloaded_bytes) {
-            job.eta_seconds = (job.total_bytes - job.downloaded_bytes) / existing.speed_bps
-          }
-        }
         // Never let a stale update rewind bytes during an active download.
         if (existing.downloaded_bytes > job.downloaded_bytes) {
           job.downloaded_bytes = existing.downloaded_bytes
         }
+        // Keep segment speeds the UI already measured when the daemon snapshot
+        // sends zeros (scheduler.snapshot always writes speed_bps: 0).
+        if (job.segments?.length && existing.segments?.length) {
+          const byId = new Map(existing.segments.map(s => [s.id, s]))
+          job.segments = job.segments.map(s => {
+            const prevSeg = byId.get(s.id)
+            if (prevSeg && (!s.speed_bps || s.speed_bps <= 0) && prevSeg.speed_bps > 0) {
+              return { ...s, speed_bps: prevSeg.speed_bps }
+            }
+            return s
+          })
+        }
       }
-      next.set(job.id, job)
+      next.set(job.id, withMeasuredSpeed(existing, job))
       break
     }
     case 'job_removed':
       next.delete(event.id)
       break
     case 'segment_progress': {
-      const job = next.get(event.job_id)
+      const job = next.get(event.job_id) as JobState | undefined
       if (job) {
         const known = job.segments.some(s => s.id === event.segment_id)
         const speedIn = event.speed_bps
@@ -117,20 +195,17 @@ export function applyJobEvent(
           job.engine === 'youtube'
             ? Math.max(event.downloaded, job.downloaded_bytes)
             : segs.reduce((a, s) => a + s.downloaded, 0)
-        const speed_bps =
-          job.engine === 'youtube'
-            ? speedIn
-            : segs.reduce((a, s) => a + s.speed_bps, 0)
-        const remaining = Math.max(0, (job.total_bytes || 0) - downloaded_bytes)
-        const eta_seconds = speed_bps > 0 ? remaining / speed_bps : job.eta_seconds
-        next.set(event.job_id, { ...job, segments: segs, downloaded_bytes, speed_bps, eta_seconds })
+        next.set(
+          event.job_id,
+          withMeasuredSpeed(job, { ...job, segments: segs, downloaded_bytes }),
+        )
       }
       break
     }
     case 'error': {
       if (event.id) {
         const job = next.get(event.id)
-        if (job) next.set(event.id, { ...job, status: 'failed' })
+        if (job) next.set(event.id, { ...job, status: 'failed', speed_bps: 0 })
       }
       break
     }
@@ -206,6 +281,17 @@ export function useDownloads() {
     }
   }, [flushBuffer])
 
+  const pendingEventsRef = useRef<DmEvent[]>([])
+  const flushFrameRef = useRef(0)
+
+  const flushPendingEvents = useCallback(() => {
+    flushFrameRef.current = 0
+    const batch = pendingEventsRef.current
+    if (batch.length === 0) return
+    pendingEventsRef.current = []
+    setJobs(prev => batch.reduce((state, event) => applyJobEvent(state, event), prev))
+  }, [])
+
   const handleLiveEvent = useCallback((ws: WebSocket, event: DmEvent) => {
     if (typeof event.seq === 'number') {
       const last = lastSeqRef.current
@@ -218,8 +304,23 @@ export function useDownloads() {
       }
       lastSeqRef.current = event.seq
     }
-    setJobs(prev => applyJobEvent(prev, event))
-  }, [])
+    /* Paint at most once per frame so fragment ticks don't re-render the list. */
+    const immediate = event.type === 'job_added' || event.type === 'job_removed' || event.type === 'error'
+    if (immediate) {
+      if (flushFrameRef.current) {
+        cancelAnimationFrame(flushFrameRef.current)
+        flushFrameRef.current = 0
+      }
+      const batch = pendingEventsRef.current
+      pendingEventsRef.current = []
+      setJobs(prev => [...batch, event].reduce((state, ev) => applyJobEvent(state, ev), prev))
+      return
+    }
+    pendingEventsRef.current.push(event)
+    if (!flushFrameRef.current) {
+      flushFrameRef.current = requestAnimationFrame(flushPendingEvents)
+    }
+  }, [flushPendingEvents])
 
   const connect = useCallback(() => {
     const state = wsRef.current?.readyState
@@ -273,6 +374,7 @@ export function useDownloads() {
     return () => {
       isMountedRef.current = false
       clearTimeout(reconnectTimer.current)
+      if (flushFrameRef.current) cancelAnimationFrame(flushFrameRef.current)
       fetchGenRef.current += 1
       wsRef.current?.close()
     }

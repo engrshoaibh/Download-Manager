@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,8 @@ use crate::persist;
 use crate::settings::{BandwidthLimiter, DaemonSettings};
 
 /// Adaptive scaler starts here and grows while throughput keeps rising.
-const INITIAL_SEGMENT_COUNT: usize = 4;
+/// Open most connections immediately. The scaler only adds the rest.
+const INITIAL_SEGMENT_COUNT: usize = 16;
 const DEFAULT_SEGMENT_COUNT: usize = 32;
 const MAX_SEGMENT_COUNT: usize = 32;
 const MIN_SEGMENT_BYTES: u64 = 256 * 1024;
@@ -33,6 +34,8 @@ pub struct JobSignal {
     pub stop: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
     pub delete_file: Arc<AtomicBool>,
+    /// Live yt-dlp / ffmpeg pid so Stop can kill the process tree immediately.
+    pub pid: Arc<AtomicU32>,
 }
 
 impl JobSignal {
@@ -41,7 +44,15 @@ impl JobSignal {
             stop: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             delete_file: Arc::new(AtomicBool::new(false)),
+            pid: Arc::new(AtomicU32::new(0)),
         })
+    }
+}
+
+fn kill_job_process(sig: &JobSignal) {
+    let pid = sig.pid.load(Ordering::Acquire);
+    if pid != 0 {
+        crate::youtube::kill_process_tree(pid);
     }
 }
 
@@ -130,6 +141,7 @@ impl DownloadManager {
             .min(MAX_SEGMENT_COUNT);
 
         let is_direct_cdn = crate::network::client::is_googlevideo_media_url(&url);
+        let is_hls = crate::youtube::is_stream_manifest_url(&url);
         let force_yt = !is_direct_cdn
             && (quality
                 .as_ref()
@@ -144,6 +156,9 @@ impl DownloadManager {
             None
         } else if crate::youtube::is_youtube_page_url(&url) {
             Some(crate::youtube::normalize_watch_url(&url))
+        } else if is_hls {
+            /* HLS/DASH manifests — yt-dlp fetches segments + remuxes */
+            Some(url.clone())
         } else if force_yt {
             crate::youtube::resolve_youtube_target(&url, referer.as_deref())
         } else {
@@ -240,6 +255,7 @@ impl DownloadManager {
     pub fn pause(&mut self, id: &JobId) -> bool {
         if let Some(sig) = self.signals.get(id) {
             sig.stop.store(true, Ordering::Release);
+            kill_job_process(sig);
         }
         if let Some(job) = self.jobs.get_mut(id) {
             if !matches!(
@@ -269,6 +285,7 @@ impl DownloadManager {
             if delete_file {
                 sig.delete_file.store(true, Ordering::Release);
             }
+            kill_job_process(sig);
         }
 
         let active = matches!(
@@ -573,6 +590,7 @@ impl DownloadManager {
             active_connections += 1;
         }
 
+        let mut checkpoint_n: u32 = 0;
         let mut last_sample_bytes = {
             steal.lock().total_downloaded()
         };
@@ -704,6 +722,7 @@ impl DownloadManager {
                 }
 
                 _ = ticker.tick() => {
+                    checkpoint_n = checkpoint_n.wrapping_add(1);
                     if signal.stop.load(Ordering::Relaxed) {
                         // Wake join loop by waiting for workers after stop.
                         if workers.is_empty() {
@@ -724,21 +743,50 @@ impl DownloadManager {
                     }
                     {
                         let mut m = mgr.write().await;
-                        if let Some(j) = m.jobs.get_mut(&job_id) {
+                        let updated = if let Some(j) = m.jobs.get_mut(&job_id) {
                             if j.status == DownloadStatus::Downloading {
-                                j.segments = snapshot;
-                                j.downloaded_bytes = downloaded;
                                 let elapsed = CHECKPOINT_INTERVAL.as_secs_f64();
                                 let sample_speed =
                                     (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed;
-                                j.speed_bps = sample_speed;
-                                if sample_speed > 0.0 && j.total_bytes > downloaded {
+                                // Smooth so a quiet 2s window doesn't drop the UI to ~0.
+                                j.speed_bps = if j.speed_bps > 1.0 && sample_speed > 0.0 {
+                                    j.speed_bps * 0.4 + sample_speed * 0.6
+                                } else if sample_speed > 0.0 {
+                                    sample_speed
+                                } else {
+                                    j.speed_bps * 0.5
+                                };
+                                let active = snapshot
+                                    .iter()
+                                    .filter(|s| s.remaining() > 0)
+                                    .count()
+                                    .max(1) as f64;
+                                let per_seg = j.speed_bps / active;
+                                j.segments = snapshot
+                                    .into_iter()
+                                    .map(|mut s| {
+                                        s.speed_bps = if s.remaining() > 0 { per_seg } else { 0.0 };
+                                        s
+                                    })
+                                    .collect();
+                                j.downloaded_bytes = downloaded;
+                                if j.speed_bps > 0.0 && j.total_bytes > downloaded {
                                     j.eta_seconds = Some(
-                                        (j.total_bytes - downloaded) as f64 / sample_speed,
+                                        (j.total_bytes - downloaded) as f64 / j.speed_bps,
                                     );
                                 }
-                                m.persist();
+                                Some(j.clone())
+                            } else {
+                                None
                             }
+                        } else {
+                            None
+                        };
+                        if updated.is_some() && checkpoint_n % 4 == 0 {
+                            m.persist();
+                        }
+                        if let Some(job) = updated {
+                            m.events.send(DmEvent::JobUpdated { job });
                         }
                     }
 
@@ -1089,14 +1137,19 @@ impl DownloadManager {
             return Err(e);
         }
 
-        /* Force yt-dlp probe even if the extension sent a size hint. The browser 
-           extension only sniffs the Content-Length of a single stream (e.g. video), 
-           so its size is always missing the audio stream or inaccurate for playlists.
-           Probing guarantees we get the exact DASH format sizes. */
-        let client_meta_ready = false;
+        /* HLS/DASH URLs are already the media. Probing them runs a second yt-dlp
+           pass before any bytes are saved and often renames the file to "index". */
+        let client_meta_ready = crate::youtube::is_stream_manifest_url(&job.url);
 
         if !client_meta_ready {
-        match crate::youtube::probe(&job.url, &opts).await {
+        match crate::youtube::probe_cancellable(
+            &job.url,
+            &opts,
+            Some(Arc::clone(&signal.stop)),
+            Some(Arc::clone(&signal.pid)),
+        )
+        .await
+        {
             Ok(info) => {
                 if signal.stop.load(Ordering::Relaxed) {
                     return Self::finalize_stop(mgr, job, None, &signal, "").await;
@@ -1245,10 +1298,9 @@ impl DownloadManager {
             // a download/resume session. On resume, yt-dlp restarts its internal
             // session counter from 0 before scanning cached fragments, so the first
             // few progress reports can be lower than the paused downloaded_bytes.
-            // Without this flag the condition below would block those updates and the
-            // progress bar stays "stuck" until yt-dlp's counter catches up, then
-            // jumps. One backward update snaps to the real workdir state (< 250 ms).
             let mut first_update = true;
+            let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            let mut last_phase = String::new();
             while let Some(progress) = prog_rx.recv().await {
                 let mut m = mgr_prog_task.write().await;
                 let Some(j) = m.jobs.get_mut(&prog_job_id) else {
@@ -1257,10 +1309,12 @@ impl DownloadManager {
                 if j.status != DownloadStatus::Downloading {
                     continue;
                 }
-                // Let total_bytes grow if yt-dlp's actual DASH stream sizes exceed
-                // our initial probe estimate. DashProgressAccum already prevents
-                // wildly volatile jumps.
-                if progress.total_bytes > j.total_bytes {
+                // Grow the total from a real content length. HLS peak-bitrate
+                // estimates (the old ~4 GB figure) must not replace a size
+                // measured from the segment playlist.
+                let manifest = crate::youtube::is_stream_manifest_url(&j.url);
+                let ignore_estimate = progress.is_estimate && (has_firm_total || manifest);
+                if progress.total_bytes > j.total_bytes && !ignore_estimate {
                     j.total_bytes = progress.total_bytes;
                 }
                 // Update downloaded: allow one backward movement at session start
@@ -1273,18 +1327,6 @@ impl DownloadManager {
                 // push total up to match it so the progress bar stays at 100%.
                 if j.total_bytes > 0 && j.downloaded_bytes > j.total_bytes {
                     j.total_bytes = j.downloaded_bytes;
-                }
-
-                // Temporary debug log so we can watch sizes in the terminal
-                if progress.percent > 0.0 {
-                    tracing::info!(
-                        "YT Progress: phase={}, in_dl={}, in_tot={}, j_dl={}, j_tot={}",
-                        progress.phase,
-                        progress.downloaded_bytes,
-                        progress.total_bytes,
-                        j.downloaded_bytes,
-                        j.total_bytes
-                    );
                 }
 
                 if progress.speed_bps > 1.0 {
@@ -1350,18 +1392,17 @@ impl DownloadManager {
                     j.segments[0].speed_bps = j.speed_bps;
                 }
 
-                let snapshot = j.clone();
-                m.events.send(DmEvent::JobUpdated {
-                    job: snapshot.clone(),
-                });
-                // Emit per-segment progress for each virtual segment.
-                for seg in &snapshot.segments {
-                    m.events.send(DmEvent::SegmentProgress {
-                        job_id: prog_job_id,
-                        segment_id: seg.id,
-                        downloaded: seg.downloaded,
-                        speed_bps: seg.speed_bps,
-                    });
+                let phase_changed = progress.phase != last_phase;
+                let due = last_emit.elapsed() >= std::time::Duration::from_millis(200);
+                let snapshot = if phase_changed || due {
+                    last_emit = std::time::Instant::now();
+                    last_phase = progress.phase.clone();
+                    Some(j.clone())
+                } else {
+                    None
+                };
+                if let Some(job) = snapshot {
+                    m.events.send(DmEvent::JobUpdated { job });
                 }
             }
         });
@@ -1374,6 +1415,7 @@ impl DownloadManager {
             &opts,
             known_total,
             stop,
+            Arc::clone(&signal.pid),
             move |progress| {
                 // #region agent log
                 {

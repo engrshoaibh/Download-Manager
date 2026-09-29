@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Download Manager Pro Integration",
   "short_name": "DM Capture",
-  "version": "1.6.2",
-  "description": "IDM-style sniffer — direct googlevideo streams with segmented downloads, YouTube quality menu, daemon capture.",
+  "version": "1.7.1",
+  "description": "IDM-style sniffer — HLS/DASH/MP4 capture, YouTube quality menu, daemon handoff.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

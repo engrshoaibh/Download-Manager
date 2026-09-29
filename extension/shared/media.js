@@ -144,16 +144,47 @@ export function isLikelyMediaUrl(url) {
   if (!url || typeof url !== 'string') return false;
   if (!/^https?:\/\//i.test(url)) return false;
   if (/^(blob:|data:)/i.test(url)) return false;
-  if (/favicon|sprite|tracking|analytics|pixel|beacon/i.test(url)) return false;
+  if (/favicon|sprite|tracking|analytics|pixel|beacon|doubleclick|googlesyndication/i.test(url)) {
+    return false;
+  }
 
   try {
     const u = new URL(url);
     const path = u.pathname.toLowerCase();
-    if (/\.(mp4|m4v|webm|mkv|mov|avi|flv|ts|m4s|mp3|m4a|aac|ogg|wav|flac|m3u8|mpd)(\?|$)/i.test(path)) {
+    const full = url.toLowerCase();
+
+    /* HLS/DASH playlists — including extensionless CDN paths ending in master/index */
+    if (/\.(m3u8|mpd)(\?|$)/i.test(path) || /\/(master|index|playlist)\.m3u8/i.test(full)) {
       return true;
     }
+    if (/\.(mp4|m4v|webm|mkv|mov|avi|flv|mp3|m4a|aac|ogg|wav|flac)(\?|$)/i.test(path)) {
+      return true;
+    }
+    /* Lone .ts/.m4s segments are not useful menu entries */
+    if (/\.(ts|m4s)(\?|$)/i.test(path) || /[?&]url=.*\.(ts|m4s)/i.test(full)) {
+      return false;
+    }
     if (/googlevideo\.com/i.test(u.hostname) && /videoplayback/i.test(path)) return true;
-    if (/\/video\/|\/videos\/|\/media\/|\/stream|playback/i.test(url)) return true;
+    /* Streaming sites often omit file extensions on HLS/DASH endpoints */
+    if (
+      /\/(hls|dash|stream|streams|manifest|playlist|master|index|play|vod|media|litro)\b/i.test(path) ||
+      /[?&](m3u8|mpd|playlist|hls|format=m3u8|type=m3u8)/i.test(full) ||
+      /mpegurl|dash\+xml|application\/vnd\.apple\.mpegurl/i.test(full)
+    ) {
+      return true;
+    }
+    if (/\/video\/|\/videos\/|\/media\/|\/stream|playback|get_video|videoplayback/i.test(full)) {
+      return true;
+    }
+    /* Common CDN hosts used by movie streamers */
+    if (
+      /\.(cloudfront\.net|akamaized\.net|cdn\.|fastly|bunnycdn|stackpathcdn|workers\.dev|premilkyway)/i.test(
+        u.hostname
+      ) &&
+      /video|stream|hls|dash|mp4|m3u8|litro/i.test(full)
+    ) {
+      return true;
+    }
   } catch {
     /* fall through */
   }
@@ -909,6 +940,18 @@ export function formatBytes(n) {
   return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
 }
 
+/**
+ * Drop sentinel lengths. 2^32 (4294967296) formats as exactly "4.0 GB"
+ * and is a bogus Content-Length, not a movie file.
+ */
+export function sanitizeByteLength(n) {
+  const x = Number(n) || 0;
+  if (x <= 0 || !Number.isFinite(x)) return 0;
+  if (x === 4294967295 || x === 4294967296 || x >= 2 ** 32) return 0;
+  if (x > 64 * 1024 * 1024 * 1024) return 0;
+  return Math.round(x);
+}
+
 /** IDM-style bitrate: "4882 kbps" */
 export function formatBitrate(bps) {
   const n = Number(bps) || 0;
@@ -989,8 +1032,8 @@ export function idmDetailLine(v = {}) {
   const parts = [fileWord];
   if (dur) parts.push(dur);
   if (quality) parts.push(`quality ${quality}`);
-  if (br) parts.push(br);
-  else if (size) parts.push(size);
+  if (size) parts.push(size);
+  else if (br) parts.push(br);
   return parts.join(', ');
 }
 
@@ -999,10 +1042,27 @@ export function pageTitleFilename(title = '') {
   let t = String(title || '')
     .replace(/\s*[\|–—]\s*YouTube\s*$/i, '')
     .replace(/\s+-\s+YouTube\s*$/i, '')
+    .replace(/\s*[\|–—]\s*HDMovies?\s*Stream.*$/i, '')
+    .replace(/\s*[\|–—]\s*Watch Free.*$/i, '')
+    .replace(/\s+Full Movie Online Free.*$/i, '')
+    .replace(/\s*\(\d{4}\)\s*$/i, '')
     .replace(/\s+/g, ' ')
     .trim();
-  if (t.length > 72) t = `${t.slice(0, 69)}…`;
+  /* Prefer "Watch …" form when the site title already has it */
+  if (t.length > 90) t = `${t.slice(0, 87)}…`;
   return t || 'Video';
+}
+
+/** Guess height from playlist path (/1080p/, /720/, index_1080.m3u8). */
+export function heightFromMediaUrl(url = '') {
+  const s = String(url || '');
+  const m =
+    s.match(/[/_-](\d{3,4})p[/_?&#.\-]/i) ||
+    s.match(/[?&](?:quality|res|height|q)=(\d{3,4})/i) ||
+    s.match(/\/(\d{3,4})p\//i);
+  if (!m) return 0;
+  const h = Number(m[1]);
+  return h >= 144 && h <= 4320 ? h : 0;
 }
 
 /** Suggest a download filename from a media URL (avoids bare "videoplayback"). */
@@ -1024,6 +1084,123 @@ export function suggestFilename(url, label = '') {
     /* ignore */
   }
   return `video_${quality || 'download'}.mp4`;
+}
+
+/**
+ * Media playlist → segments. BYTERANGE lengths are exact byte sizes.
+ * Returns { duration, segments, mapUrl, mapBytes }.
+ */
+export function parseM3u8Media(text, baseUrl) {
+  const lines = String(text || '').split(/\r?\n/);
+  const segments = [];
+  let duration = 0;
+  let pendingDur = 0;
+  let pendingRange = null;
+  let mapUrl = '';
+  let mapBytes = 0;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXTINF:')) {
+      pendingDur = Number(line.slice('#EXTINF:'.length).split(',')[0]) || 0;
+      duration += pendingDur;
+      continue;
+    }
+    if (line.startsWith('#EXT-X-BYTERANGE:')) {
+      const spec = line.slice('#EXT-X-BYTERANGE:'.length).trim();
+      const [len, off] = spec.split('@');
+      pendingRange = { length: Number(len) || 0, offset: off != null ? Number(off) : null };
+      continue;
+    }
+    if (line.startsWith('#EXT-X-MAP:')) {
+      const uri = /URI="([^"]+)"/i.exec(line);
+      const br = /BYTERANGE="(\d+)(?:@(\d+))?"/i.exec(line);
+      if (uri) {
+        try {
+          mapUrl = new URL(uri[1], baseUrl).href;
+        } catch {
+          mapUrl = uri[1];
+        }
+      }
+      if (br) mapBytes = Number(br[1]) || 0;
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    let abs = line;
+    try {
+      abs = new URL(line, baseUrl).href;
+    } catch {
+      /* keep */
+    }
+    segments.push({ url: abs, duration: pendingDur, byterange: pendingRange });
+    pendingDur = 0;
+    pendingRange = null;
+  }
+  if (!duration) duration = parseM3u8Duration(text);
+  return { duration, segments, mapUrl, mapBytes };
+}
+
+/** Exact size when every segment declares EXT-X-BYTERANGE, plus the init map. */
+export function sizeFromByteranges(parsed) {
+  if (!parsed?.segments?.length) return 0;
+  if (!parsed.segments.every((s) => s.byterange && s.byterange.length > 0)) return 0;
+  const seg = parsed.segments.reduce((sum, s) => sum + s.byterange.length, 0);
+  return seg + (Number(parsed.mapBytes) || 0);
+}
+
+/** Indexes of segments to sample for Content-Length (first, middle, last). */
+export function sampleSegmentIndexes(count) {
+  const n = Number(count) || 0;
+  if (n <= 0) return [];
+  if (n <= 3) return [...Array(n).keys()];
+  return [0, Math.floor(n / 2), n - 1];
+}
+
+/**
+ * Turn sampled segment sizes into a playlist total.
+ * Prefers bytes/second × real duration so a short last segment does not skew the total.
+ */
+export function extrapolatePlaylistBytes(parsed, samples) {
+  const exact = sizeFromByteranges(parsed);
+  if (exact > 0) return exact;
+  const good = (samples || []).filter((s) => s && s.bytes > 0);
+  if (!good.length || !parsed?.segments?.length) return 0;
+  const byteSum = good.reduce((sum, s) => sum + s.bytes, 0);
+  const durSum = good.reduce((sum, s) => sum + (Number(s.duration) || 0), 0);
+  const mapBytes = Number(parsed.mapBytes) || 0;
+  if (byteSum > 0 && durSum > 0 && parsed.duration > 0) {
+    return Math.round((byteSum / durSum) * parsed.duration) + mapBytes;
+  }
+  const avg = byteSum / good.length;
+  return Math.round(avg * parsed.segments.length) + mapBytes;
+}
+
+/** Default audio rendition URI for each EXT-X-MEDIA GROUP-ID. */
+export function parseHlsAudioGroups(text, baseUrl) {
+  const groups = new Map();
+  const re = /#EXT-X-MEDIA:([^\n\r]*)/gi;
+  let m;
+  while ((m = re.exec(text || ''))) {
+    const attrs = m[1] || '';
+    if (!/TYPE=AUDIO/i.test(attrs)) continue;
+    const id = /GROUP-ID="([^"]+)"/i.exec(attrs);
+    const uri = /URI="([^"]+)"/i.exec(attrs);
+    if (!id || !uri) continue;
+    let abs = uri[1];
+    try {
+      abs = new URL(uri[1], baseUrl).href;
+    } catch {
+      /* keep */
+    }
+    const isDefault = /DEFAULT=YES/i.test(attrs);
+    const prev = groups.get(id[1]);
+    if (!prev || (isDefault && !prev.def)) {
+      groups.set(id[1], { url: abs, def: isDefault });
+    }
+  }
+  const out = new Map();
+  for (const [id, v] of groups) out.set(id, v.url);
+  return out;
 }
 
 /** Sum #EXTINF durations from a media playlist. */
@@ -1075,11 +1252,13 @@ export function parseM3u8Master(text, baseUrl, { expandContainers = true, durati
     const width = res ? Number(res[1]) : 0;
     const height = res ? Number(res[2]) : 0;
     const bandwidth = Number((avgBw && avgBw[1]) || (bw && bw[1]) || 0);
+    const audioAttr = /AUDIO="([^"]+)"/i.exec(info);
     const label =
       (name && name[1]) ||
       guessResolution({ width, height, url: abs }) ||
       'Default';
-    const size = duration > 0 && bandwidth > 0 ? Math.round((bandwidth * duration) / 8) : 0;
+    /* Size is filled later from real segment lengths. BANDWIDTH is a peak
+       ceiling, so peak × duration (the old 4.0 GB figure) is not the file size. */
     const base = {
       url: abs,
       masterUrl: baseUrl,
@@ -1089,9 +1268,10 @@ export function parseM3u8Master(text, baseUrl, { expandContainers = true, durati
       bandwidth,
       bitrate: bandwidth,
       duration,
-      size,
-      sizeLabel: size ? formatBytes(size) : '',
+      size: 0,
+      sizeLabel: '',
       codecs: codecs ? codecs[1] : '',
+      audioGroup: audioAttr ? audioAttr[1] : '',
       type: 'hls',
       progressive: false,
     };
@@ -1210,6 +1390,7 @@ export function enrichVariantForMenu(item, { title = '', duration = 0 } = {}) {
         (item.type === 'hls' ? 'TS' : item.ext ? String(item.ext).toUpperCase() : 'MP4'));
   const height =
     item.height ||
+    heightFromMediaUrl(url) ||
     Number(String(item.quality || item.label || '').replace(/\D/g, '')) ||
     0;
   const dur = Number(item.duration || duration || 0);
@@ -1271,7 +1452,8 @@ export function dedupeVariants(items) {
     if (better) map.set(key, enriched);
   }
 
-  /* Collapse same resolution+container: keep progressive over adaptive */
+  /* Collapse same resolution+container: keep progressive over adaptive.
+   * HLS keeps separate bandwidth / URL rows (IDM shows many near-duplicates). */
   const byRes = new Map();
   for (const item of map.values()) {
     if (item.processor) {
@@ -1280,6 +1462,19 @@ export function dedupeVariants(items) {
     }
     if (item.audio) {
       byRes.set(`audio:${item.ext}:${item.itag || item.url}`, item);
+      continue;
+    }
+    const isHls =
+      item.type === 'hls' ||
+      item.type === 'dash' ||
+      /\.m3u8(\?|$)/i.test(item.url || '') ||
+      /\.mpd(\?|$)/i.test(item.url || '');
+    if (isHls) {
+      const bwBucket = Math.round((Number(item.bandwidth) || 0) / 50_000);
+      byRes.set(
+        `hls:${mediaDedupeKey(item.url)}|${item.container || item.ext || 'file'}|${bwBucket}|${item.height || 0}`,
+        item
+      );
       continue;
     }
     const res = normalizeResLabel(item.label).replace(/\s+.*/, '');
@@ -1307,6 +1502,10 @@ export function dedupeVariants(items) {
       Number(String(b.quality || b.label || '').replace(/\D/g, '')) ||
       resolutionSortKey(b.label);
     if (hb !== ha) return hb - ha;
+    /* Higher bitrate first within same height (IDM lists multiple 1080p) */
+    const ba = Number(a.bandwidth || a.bitrate || 0);
+    const bb = Number(b.bandwidth || b.bitrate || 0);
+    if (bb !== ba) return bb - ba;
     /* TS before MP4 within same quality (IDM order) */
     const ca = String(a.container || '');
     const cb = String(b.container || '');
@@ -1319,10 +1518,30 @@ export function dedupeVariants(items) {
 /** Skip tiny CDN chunks that are not full representations. */
 export function shouldKeepMediaHit(url, size = 0) {
   if (!url) return false;
-  if (/favicon|sprite|tracking|analytics/i.test(url)) return false;
+  if (/favicon|sprite|tracking|analytics|pixel|beacon/i.test(url)) return false;
   const yt = youtubeItagInfo(url);
   if (yt) return true; /* full stream identified by itag */
-  if (/\.m3u8(\?|$)/i.test(url)) return true;
+
+  /* Prefer playlists over individual HLS/DASH fragments */
+  if (/\.m3u8(\?|$)/i.test(url) || /\.mpd(\?|$)/i.test(url)) return true;
+  if (/[?&](m3u8|mpd|playlist|hls)/i.test(url)) return true;
+  if (/\/(master|index|playlist|manifest)\.m3u8/i.test(url)) return true;
+  if (/\/(hls|dash|playlist|master|manifest)\b/i.test(url)) return true;
+
+  /* Drop media segments (proxied or direct) — they flood the menu */
+  if (
+    /\.m4s(\?|$)/i.test(url) ||
+    /\/seg-\d+/i.test(url) ||
+    /[?&]url=.*\.(ts|m4s)(%|\?|&|$)/i.test(url) ||
+    (/\.ts(\?|$)/i.test(url) && !/\.m3u8/i.test(url))
+  ) {
+    return false;
+  }
+  /* /litro/ carries every HLS segment on these players. Keep playlists and full files only. */
+  if (/\/litro\b/i.test(url) && !/\.(m3u8|mpd|mp4|m4v|webm)(\?|$)/i.test(url)) {
+    return false;
+  }
+
   if (size > 0 && size < 128 * 1024) return false;
   return isLikelyMediaUrl(url);
 }

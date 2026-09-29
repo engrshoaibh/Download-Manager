@@ -9,6 +9,8 @@
   const banners = new WeakMap();
   /** videos we already observed */
   const watchedVideos = new WeakSet();
+  /** IDM-style: only show banner after playback has started */
+  const startedVideos = new WeakSet();
   let settings = null;
   let mediaPanel = null;
   let sniffTimer = null;
@@ -16,6 +18,7 @@
   let openMenu = null;
   /** @type {{ watch: string, items: any[], title?: string, duration?: number, ts: number } | null} */
   let ytInstantCache = null;
+  let iframeStreamReady = false;
 
   /** Safe messaging — avoids crashes after extension reload / SW sleep. */
   function runtimeSend(msg) {
@@ -28,8 +31,9 @@
   }
 
   async function init() {
-    if (window !== window.top) {
-      /* Subframes: no banners / sniff / scrape — parent frame owns YouTube UI */
+    const isTop = window === window.top;
+    /* YouTube UI lives in the top frame only; movie sites often put the player in an iframe. */
+    if (!isTop && isYouTubeHost(location.hostname)) {
       return;
     }
 
@@ -39,22 +43,29 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === 'sync' && changes.settings) {
         settings = { ...settings, ...changes.settings.newValue };
-        if (settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
-        else removeMediaPanel();
+        if (isTop && settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
+        else if (isTop) removeMediaPanel();
         if (settings?.videoBanner !== false) scheduleBanners();
         else removeAllBanners();
       }
     });
 
-    document.addEventListener('click', onClick, true);
-    document.addEventListener('auxclick', onAuxClick, true);
-    document.addEventListener('click', closeMenusOnOutside, true);
+    if (isTop) {
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('auxclick', onAuxClick, true);
+      /* Bubble phase so the banner button can open the menu without racing a capture closer */
+      document.addEventListener('click', closeMenusOnOutside, false);
+    }
 
     chrome.runtime.onMessage.addListener((msg) => {
-      if (msg.type === 'SHOW_TOAST') showToast(msg.message, msg.level || 'info');
+      if (msg.type === 'SHOW_TOAST' && isTop) showToast(msg.message, msg.level || 'info');
       if (msg.type === 'SNIFF_NOW' || msg.type === 'MEDIA_UPDATED') {
-        if (!isYouTubeHere()) scheduleMediaSniff();
-        scheduleBanners();
+        if (isTop && !isYouTubeHere()) scheduleMediaSniff();
+        /* Don't rebuild banners while the quality menu is open — that removes the menu */
+        if (!openMenu) scheduleBanners();
+        else if (isTop) refreshMenuFromTab();
+        /* IDM: reveal iframe banner once streams are sniffed (video started) */
+        if (isTop) refreshIframeBannerVisibility();
       }
       if (msg.type === 'YOUTUBE_PROBE_READY' && msg.items?.length) {
         ytInstantCache = {
@@ -67,29 +78,136 @@
     });
 
     /* Media grabber is noisy on YouTube (CDN flood); banner handles downloads there */
-    if (settings?.mediaGrabber !== false && !isYouTubeHere()) scheduleMediaSniff();
+    if (isTop && settings?.mediaGrabber !== false && !isYouTubeHere()) scheduleMediaSniff();
     if (settings?.videoBanner !== false) scheduleBanners();
-    prefetchYoutubeIfNeeded();
+    if (isTop) prefetchYoutubeIfNeeded();
 
-    const mo = new MutationObserver(() => {
-      if (settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
+    const mo = new MutationObserver((mutations) => {
+      if (openMenu) return;
+      if (isOurUiMutation(mutations)) return;
+      if (isTop && settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
       if (settings?.videoBanner !== false) scheduleBanners();
     });
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
+    watchNetworkResources();
+    injectPlayerHooks();
+
     /* YouTube SPA navigations */
-    window.addEventListener('yt-navigate-finish', () => {
-      ytInstantCache = null;
-      prefetchYoutubeIfNeeded();
-    });
-    let lastHref = location.href;
-    setInterval(() => {
-      if (location.href !== lastHref) {
-        lastHref = location.href;
+    if (isTop) {
+      window.addEventListener('yt-navigate-finish', () => {
         ytInstantCache = null;
         prefetchYoutubeIfNeeded();
+      });
+      let lastHref = location.href;
+      setInterval(() => {
+        if (location.href !== lastHref) {
+          lastHref = location.href;
+          ytInstantCache = null;
+          prefetchYoutubeIfNeeded();
+        }
+      }, 800);
+    }
+  }
+
+  /** Capture HLS/DASH URLs from the resource timeline (works when video.src is blob:). */
+  function watchNetworkResources() {
+    const report = (url) => {
+      if (!url || typeof url !== 'string' || !/^https?:/i.test(url)) return;
+      if (/favicon|sprite|tracking|analytics|pixel|beacon/i.test(url)) return;
+      if (
+        !/\.(m3u8|mpd|mp4|m4v|webm)(\?|$)/i.test(url) &&
+        !/[?&](m3u8|mpd|playlist|hls)/i.test(url) &&
+        !/\/(hls|dash|playlist|master|manifest|stream|litro)\b/i.test(url) &&
+        !/master\.m3u8|index\.m3u8/i.test(url)
+      ) {
+        return;
       }
-    }, 800);
+      if (/\.(ts|m4s)(\?|$)/i.test(url)) return;
+      if (/\/litro\b/i.test(url) && !/\.(m3u8|mpd|mp4|m4v|webm)(\?|$)/i.test(url)) return;
+      runtimeSend({ type: 'REGISTER_MEDIA', url }).catch(() => {});
+    };
+
+    try {
+      performance.getEntriesByType('resource').forEach((e) => report(e.name));
+      const po = new PerformanceObserver((list) => {
+        list.getEntries().forEach((e) => report(e.name));
+      });
+      po.observe({ type: 'resource', buffered: true });
+    } catch {
+      /* older browsers */
+    }
+
+    window.addEventListener('message', (ev) => {
+      if (ev.source !== window) return;
+      const data = ev.data;
+      if (!data || data.source !== 'dm-player-hook' || !data.url) return;
+      report(data.url);
+    });
+  }
+
+  /** Page-world hooks for hls.js / fetch of manifests (blob players). */
+  function injectPlayerHooks() {
+    try {
+      const s = document.createElement('script');
+      s.textContent = `(() => {
+        if (window.__dmPlayerHooked) return;
+        window.__dmPlayerHooked = true;
+        const post = (url) => {
+          try {
+            if (!url || typeof url !== 'string') return;
+            if (!/^https?:/i.test(url)) return;
+            window.postMessage({ source: 'dm-player-hook', url }, '*');
+          } catch (_) {}
+        };
+        const looksMedia = (u) =>
+          /\\.(m3u8|mpd|mp4|m4v|webm)(\\?|$)/i.test(u) ||
+          /[?&](m3u8|mpd|playlist|hls)/i.test(u) ||
+          /\\/(hls|dash|playlist|master|manifest|stream|litro)\\b/i.test(u) ||
+          /master\\.m3u8|index\\.m3u8/i.test(u);
+
+        const origFetch = window.fetch;
+        if (typeof origFetch === 'function') {
+          window.fetch = function (...args) {
+            try {
+              const u = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+              if (u && looksMedia(u)) post(u);
+            } catch (_) {}
+            return origFetch.apply(this, args);
+          };
+        }
+
+        const XO = window.XMLHttpRequest;
+        if (XO && XO.prototype) {
+          const open = XO.prototype.open;
+          XO.prototype.open = function (method, url, ...rest) {
+            try {
+              if (url && looksMedia(String(url))) post(String(url));
+            } catch (_) {}
+            return open.call(this, method, url, ...rest);
+          };
+        }
+
+        const wrapHls = () => {
+          const H = window.Hls;
+          if (!H || H.__dmWrapped) return;
+          H.__dmWrapped = true;
+          const load = H.prototype.loadSource;
+          if (typeof load === 'function') {
+            H.prototype.loadSource = function (src) {
+              post(src);
+              return load.call(this, src);
+            };
+          }
+        };
+        wrapHls();
+        setInterval(wrapHls, 1500);
+      })();`;
+      (document.documentElement || document.head).appendChild(s);
+      s.remove();
+    } catch {
+      /* CSP may block — webRequest + PerformanceObserver still help */
+    }
   }
 
   function isYouTubeHere() {
@@ -151,6 +269,26 @@
     return { title, duration };
   }
 
+  let menuRefreshTimer = null;
+
+  /** Replace open rows once playlist segment sizes are known. */
+  function refreshMenuFromTab() {
+    if (!openMenu) return;
+    clearTimeout(menuRefreshTimer);
+    menuRefreshTimer = setTimeout(() => {
+      runtimeSend({ type: 'GET_TAB_MEDIA' })
+        .then((res) => {
+          const items = res?.items || [];
+          if (!openMenu || !items.length) return;
+          const measured = items.some((m) => Number(m.size) > 0);
+          const already = (openMenu.variants || []).some((v) => Number(v.size) > 0);
+          if (!measured && already) return;
+          refreshOpenMenu(items);
+        })
+        .catch(() => {});
+    }, 250);
+  }
+
   function refreshOpenMenu(items) {
     if (!openMenu?.menu || !items?.length) return;
     const sorted = finalizeVariants(items);
@@ -183,6 +321,22 @@
     if (!openMenu) return;
     if (e.target?.closest?.('.dm-video-banner, .dm-res-menu')) return;
     closeOpenMenu();
+  }
+
+  /** Mutations from our own banner/menu/toast — don't re-scan and tear down the UI. */
+  function isOurUiMutation(mutations) {
+    const ours = (node) => {
+      if (!node || node.nodeType !== 1) return false;
+      return !!(
+        node.matches?.('.dm-video-banner, .dm-res-menu, #dm-media-grabber, #dm-toast, .dm-vb-host') ||
+        node.closest?.('.dm-video-banner, .dm-res-menu, #dm-media-grabber, #dm-toast')
+      );
+    };
+    return mutations.every((m) => {
+      if (ours(m.target)) return true;
+      const nodes = [...m.addedNodes, ...m.removedNodes];
+      return nodes.length > 0 && nodes.every((n) => n.nodeType !== 1 || ours(n));
+    });
   }
 
   /** Unwrap Google / social redirectors to the real destination URL. */
@@ -342,11 +496,15 @@
       removeAllBanners();
       return;
     }
+    /* Keep the open quality menu stable — rebuilding banners removes it */
+    if (openMenu) return;
 
     const videos = mainPlayerVideos();
     const keep = new Set(videos);
 
     document.querySelectorAll('.dm-video-banner').forEach((el) => {
+      /* Iframe banners are managed in attachIframeBanners — never strip them here */
+      if (el.dataset.dmIframe) return;
       const host = el.parentElement;
       const video = host?.querySelector?.('video') || null;
       if (!video || !keep.has(video)) {
@@ -359,11 +517,162 @@
       ensureBanner(video);
       if (!watchedVideos.has(video)) {
         watchedVideos.add(video);
+        const onStart = () => {
+          startedVideos.add(video);
+          refreshBanner(video);
+        };
+        video.addEventListener('play', onStart);
+        video.addEventListener('playing', onStart);
         video.addEventListener('loadedmetadata', () => refreshBanner(video));
-        video.addEventListener('play', () => refreshBanner(video));
         video.addEventListener('emptied', () => refreshBanner(video));
+        /* Already playing when we attach (SPA / late inject) */
+        if (!video.paused || video.currentTime > 0.15) onStart();
       }
     });
+
+    /* Cross-origin embeds (hdmoviesstream → nxsha, vidsrc, …): no <video> in top frame */
+    if (window === window.top && !isYouTubeHere()) {
+      attachIframeBanners();
+      refreshIframeBannerVisibility();
+    }
+  }
+
+  function attachIframeBanners() {
+    if (openMenu) return;
+    const frames = [...document.querySelectorAll('iframe')].filter((f) => {
+      const r = f.getBoundingClientRect();
+      if (r.width < 280 || r.height < 160) return false;
+      const src = f.src || f.getAttribute('data-src') || '';
+      return (
+        /embed|player|watch|movie|video|stream|vidsrc|nxsha|multiembed|2embed/i.test(src) ||
+        /embed|player|video/i.test(f.className + f.id) ||
+        (r.width >= 400 && r.height >= 220)
+      );
+    });
+    const keepHosts = new Set(frames);
+    document.querySelectorAll('.dm-video-banner[data-dm-iframe]').forEach((el) => {
+      if (openMenu && openMenu.banner === el) return;
+      const host = el.parentElement;
+      const iframe = host?.querySelector?.('iframe');
+      if (!iframe || !keepHosts.has(iframe)) el.remove();
+    });
+    frames.forEach((iframe) => {
+      if (iframe.dataset.dmBannerAttached === '1' && iframe.parentElement?.querySelector('.dm-video-banner')) {
+        return;
+      }
+      iframe.dataset.dmBannerAttached = '1';
+      const host = iframe.parentElement || document.documentElement;
+      const style = getComputedStyle(host);
+      if (style.position === 'static') host.classList.add('dm-vb-host');
+      let banner = host.querySelector(':scope > .dm-video-banner[data-dm-iframe]');
+      if (!banner) {
+        banner = buildBannerEl({ iframe: true });
+        host.appendChild(banner);
+        wireBannerControls(banner, {
+          onDownload: () => toggleIframeResolutionMenu(iframe, banner),
+          onClose: () => {
+            banner.classList.add('dm-vb-hidden');
+            banner.dataset.dmClosed = '1';
+          },
+        });
+        placeBannerOnHost(banner, host);
+      }
+    });
+  }
+
+  /** Reveal embed banners only after HLS/MP4 streams appear (video started playing). */
+  function refreshIframeBannerVisibility() {
+    if (window !== window.top) return;
+    runtimeSend({ type: 'GET_TAB_MEDIA' })
+      .then((res) => {
+        const items = res?.items || [];
+        iframeStreamReady = items.some(
+          (m) =>
+            m?.url &&
+            (/\.m3u8(\?|$)/i.test(m.url) ||
+              /\.mpd(\?|$)/i.test(m.url) ||
+              /\.mp4(\?|$)/i.test(m.url) ||
+              m.type === 'hls' ||
+              m.type === 'dash' ||
+              (Number(m.size) || 0) > 256 * 1024)
+        );
+        document.querySelectorAll('.dm-video-banner[data-dm-iframe]').forEach((el) => {
+          if (el.dataset.dmClosed === '1') {
+            el.classList.add('dm-vb-hidden');
+            return;
+          }
+          if (openMenu && openMenu.banner === el) {
+            el.classList.remove('dm-vb-hidden');
+            return;
+          }
+          if (iframeStreamReady) el.classList.remove('dm-vb-hidden');
+          else el.classList.add('dm-vb-hidden');
+          placeBannerOnHost(el, el.parentElement);
+        });
+      })
+      .catch(() => {});
+  }
+
+  async function toggleIframeResolutionMenu(iframe, banner) {
+    if (openMenu && openMenu.banner === banner) {
+      closeOpenMenu();
+      return;
+    }
+    closeOpenMenu();
+    const btn = banner.querySelector('.dm-vb-btn');
+    const { title: pageTitle } = pageMeta(null);
+    btn.classList.add('dm-vb-loading');
+    btn.querySelector('.dm-vb-text').textContent = 'Detecting…';
+    try {
+      const sniffed = await runtimeSend({ type: 'GET_TAB_MEDIA' });
+      let variants = finalizeVariants(
+        (sniffed?.items || []).map((n) => ({
+          ...n,
+          title: n.title || pageTitle,
+        }))
+      );
+      if (variants.length) {
+        showResolutionMenu(iframe, banner, variants);
+      }
+      const resolved = await runtimeSend({
+        type: 'RESOLVE_VARIANTS',
+        url: '',
+        domSources: [],
+        title: pageTitle,
+      });
+      let merged = finalizeVariants(
+        (resolved?.variants || []).map((n) => ({
+          ...n,
+          title: n.title || pageTitle,
+        }))
+      );
+      if (!merged.length) {
+        await runtimeSend({ type: 'SNIFF_TAB_NOW' });
+        const again = await runtimeSend({ type: 'GET_TAB_MEDIA' });
+        merged = finalizeVariants(
+          (again?.items || []).map((n) => ({
+            ...n,
+            title: n.title || pageTitle,
+          }))
+        );
+      }
+      if (!merged.length) {
+        if (!openMenu) {
+          showToast('Play the video for a few seconds, then open the menu again', 'error');
+        }
+        return;
+      }
+      if (openMenu && openMenu.banner === banner) {
+        refreshOpenMenu(merged);
+      } else if (!openMenu) {
+        showResolutionMenu(iframe, banner, merged);
+      }
+    } catch (err) {
+      showToast(err.message || 'Failed to detect streams', 'error');
+    } finally {
+      btn.classList.remove('dm-vb-loading');
+      btn.querySelector('.dm-vb-text').textContent = 'Download this video';
+    }
   }
 
   /** Only the currently playing main player — not sidebar / suggested previews. */
@@ -377,16 +686,76 @@
       return main ? [main] : [];
     }
 
-    // Other sites: prefer large playing videos; skip tiny thumbnails.
+    // Other sites: prefer large videos (playing or paused main player); skip tiny thumbs.
     return [...document.querySelectorAll('video')].filter((video) => {
       if (!(video instanceof HTMLVideoElement)) return false;
       const rect = video.getBoundingClientRect();
-      if (rect.width < 240 || rect.height < 135) return false;
-      if (video.closest('[class*="recommend"], [class*="related"], [class*="sidebar"]')) {
+      if (rect.width < 200 || rect.height < 110) return false;
+      if (video.closest('[class*="recommend"], [class*="related"], [class*="sidebar"], [class*="thumb"]')) {
         return false;
       }
       return true;
     });
+  }
+
+  /** IDM-style top bar: green mark + label + close. */
+  function buildBannerEl({ iframe = false } = {}) {
+    const banner = document.createElement('div');
+    banner.className = 'dm-video-banner dm-vb-hidden';
+    if (iframe) banner.dataset.dmIframe = '1';
+    banner.innerHTML = `
+      <div class="dm-vb-bar">
+        <button type="button" class="dm-vb-btn" title="Download this video">
+          <span class="dm-vb-icon" aria-hidden="true">▶</span>
+          <span class="dm-vb-text">Download this video</span>
+        </button>
+        <span class="dm-vb-actions">
+          <button type="button" class="dm-vb-action dm-vb-close" title="Hide">×</button>
+        </span>
+      </div>
+    `;
+    return banner;
+  }
+
+  function wireBannerControls(banner, { onDownload, onClose }) {
+    banner.querySelector('.dm-vb-btn').addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      onDownload?.();
+    });
+    banner.querySelector('.dm-vb-close')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      closeOpenMenu();
+      onClose?.();
+    });
+  }
+
+  /**
+   * Default: top-right on the player (always visible).
+   * Use "above" only when the host has clear space and does not clip.
+   */
+  function placeBannerOnHost(banner, host) {
+    if (!banner || !host) return;
+    const rect = host.getBoundingClientRect();
+    let overflowHidden = false;
+    try {
+      let el = host;
+      for (let i = 0; i < 6 && el; i += 1) {
+        const s = getComputedStyle(el);
+        if (/hidden|auto|scroll/i.test(s.overflow + s.overflowY + s.overflowX)) {
+          overflowHidden = true;
+          break;
+        }
+        el = el.parentElement;
+      }
+    } catch {
+      overflowHidden = true;
+    }
+    const roomAbove = rect.top >= 28 && !overflowHidden;
+    banner.classList.toggle('dm-vb-above', roomAbove);
   }
 
   function ensureBanner(video) {
@@ -396,27 +765,18 @@
       return banner;
     }
 
-    banner = document.createElement('div');
-    banner.className = 'dm-video-banner';
-    banner.innerHTML = `
-      <button type="button" class="dm-vb-btn" title="Download this video">
-        <span class="dm-vb-icon" aria-hidden="true">⬇</span>
-        <span class="dm-vb-text">Download this video</span>
-        <span class="dm-vb-caret">▾</span>
-      </button>
-    `;
-
+    banner = buildBannerEl();
     const host = findBannerHost(video);
     host.appendChild(banner);
     banners.set(video, banner);
-    positionBanner(video, banner);
-
-    banner.querySelector('.dm-vb-btn').addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      toggleResolutionMenu(video, banner);
+    wireBannerControls(banner, {
+      onDownload: () => toggleResolutionMenu(video, banner),
+      onClose: () => {
+        banner.classList.add('dm-vb-hidden');
+        banner.dataset.dmClosed = '1';
+      },
     });
-
+    positionBanner(video, banner);
     return banner;
   }
 
@@ -438,20 +798,36 @@
     return parent;
   }
 
+  /** True once the user (or autoplay) has started this player. */
+  function videoPlaybackStarted(video) {
+    if (!(video instanceof HTMLVideoElement)) return false;
+    if (startedVideos.has(video)) return true;
+    if (!video.paused || video.currentTime > 0.15) {
+      startedVideos.add(video);
+      return true;
+    }
+    return false;
+  }
+
   function positionBanner(video, banner) {
-    /* Prefer overlaying the video box itself when parent is tight */
     const rect = video.getBoundingClientRect();
-    if (rect.width < 160 || rect.height < 90) {
+    const keepOpen = openMenu && openMenu.banner === banner;
+    if (banner.dataset.dmClosed === '1') {
+      banner.classList.add('dm-vb-hidden');
+      return;
+    }
+    if (rect.width < 160 || rect.height < 90 || (!keepOpen && !videoPlaybackStarted(video))) {
       banner.classList.add('dm-vb-hidden');
       return;
     }
     banner.classList.remove('dm-vb-hidden');
+    placeBannerOnHost(banner, banner.parentElement || findBannerHost(video));
   }
 
   function refreshBanner(video) {
     const banner = banners.get(video);
     if (banner) positionBanner(video, banner);
-    registerVideoSources(video);
+    if (videoPlaybackStarted(video)) registerVideoSources(video);
   }
 
   function registerVideoSources(video) {
@@ -619,7 +995,7 @@
         }
       }
 
-      merged = merged.filter((v) => v.url && !v.url.startsWith('blob:'));
+      merged = merged.filter((v) => v.url && !String(v.url).startsWith('blob:'));
 
       if (!merged.length && primary && !primary.startsWith('blob:')) {
         merged = [{
@@ -734,50 +1110,49 @@
     banner.appendChild(menu);
     openMenu = { menu, banner, video, variants };
 
-    /* Keep menu on-screen */
+    /* Keep menu on-screen; open downward from the top-right bar */
     requestAnimationFrame(() => {
       const r = menu.getBoundingClientRect();
       if (r.bottom > window.innerHeight - 8) {
         menu.classList.add('dm-res-up');
       }
+      if (r.left < 8) {
+        menu.style.right = 'auto';
+        menu.style.left = '0';
+      }
     });
   }
 
   function fillMenuList(ul, variants) {
-    const pageTitle =
-      variants.find((v) => v.title)?.title ||
-      document.querySelector('meta[property="og:title"]')?.content ||
-      document.title ||
-      'Video';
+    const pageTitle = bestVideoTitle(
+      variants.find((v) => v.title)?.title || ''
+    );
 
-    variants.slice(0, 20).forEach((v, idx) => {
-      const li = document.createElement('li');
-      const title = (v.title || pageTitle || 'Video').trim();
-      /* IDM-style: resolution is the primary row label, not the video title */
-      const resLabel =
-        v.audio || v.quality === 'audio'
-          ? 'Audio only'
-          : v.quality === 'best' || v.label === 'Best'
-            ? 'Best'
-            : v.label && /\d{3,4}\s*p/i.test(String(v.label))
-              ? String(v.label)
-              : v.height
-                ? `${v.height}p`
-                : String(v.label || 'Video');
+    variants.slice(0, 40).forEach((v, idx) => {
+      const title = bestVideoTitle(v.title || pageTitle || 'Video');
       const detail =
         v.detail ||
         [
-          v.container ? `${v.container} file` : '',
+          v.container ? `${v.container === 'HLS' ? 'TS' : v.container} file` : '',
+          v.duration ? '' : '',
           v.sizeLabel || (v.size ? formatSize(v.size) : ''),
-          title && title.length < 80 ? title : '',
         ]
           .filter(Boolean)
           .join(', ') ||
         shortHost(v.url);
+      /* IDM row: "1. Watch Title Free, TS file, 2 hours 44 min, quality 1080p HD, 2427 kbps" */
+      const line = `${idx + 1}. ${title}, ${detail}`;
+      const resLabel =
+        v.audio || v.quality === 'audio'
+          ? 'Audio only'
+          : v.height
+            ? `${v.height}p`
+            : String(v.label || '').match(/(\d{3,4})\s*p/i)?.[0] ||
+              String(v.label || 'Video');
+      const li = document.createElement('li');
       li.innerHTML = `
-        <button type="button" class="dm-res-item${idx === 0 ? ' dm-res-best' : ''}">
-          <span class="dm-res-label">${escapeHtml(resLabel)}</span>
-          <span class="dm-res-meta">${escapeHtml(detail)}</span>
+        <button type="button" class="dm-res-item${idx === 0 ? ' dm-res-best' : ''}" title="${escapeAttr(line)}">
+          <span class="dm-res-label">${escapeHtml(line)}</span>
         </button>
       `;
       li.querySelector('button').addEventListener('click', (e) => {
@@ -788,13 +1163,19 @@
         const quality =
           v.quality ||
           (v.audio ? 'audio' : String(v.label || '').match(/(\d{3,4})/)?.[1]) ||
+          (v.height ? String(v.height) : undefined) ||
           (v.processor ? 'best' : undefined);
-        const ext = v.ext || (v.container === 'TS' ? 'ts' : v.audio ? 'm4a' : 'mp4');
+        const isHls =
+          v.type === 'hls' ||
+          (v.url && /\.m3u8(\?|$)/i.test(v.url)) ||
+          (v.masterUrl && /\.m3u8(\?|$)/i.test(v.masterUrl));
+        const wantTs = /^ts$/i.test(String(v.container || v.ext || ''));
+        const ext = isHls ? (wantTs ? 'ts' : 'mp4') : v.ext || (wantTs ? 'ts' : v.audio ? 'm4a' : 'mp4');
         const safeTitle = title
           .replace(/[<>:"/\\|?*]+/g, '')
           .replace(/\s+/g, ' ')
           .trim()
-          .slice(0, 80);
+          .slice(0, 100);
         const qTag = String(quality || resLabel || '')
           .replace(/[^\w.\-]+/g, '')
           .slice(0, 24);
@@ -807,18 +1188,28 @@
           v.stream ||
           (v.url && /googlevideo\.com/i.test(v.url) && /videoplayback/i.test(v.url));
         const itag = String(v.formatId || '').replace(/\D/g, '');
-        /* Pin adaptive itag so daemon merges the same 4K/2K/1080 stream the menu showed */
         const pinnedFormat =
           itag && !v.progressive && !v.audio ? `${itag}+bestaudio/ba` : undefined;
+        /* HLS: download this variant playlist (already the chosen quality) */
+        const captureUrl = v.url || v.masterUrl;
         runtimeSend({
           type: settings?.captureMode === 'auto' ? 'CAPTURE_URL' : 'OPEN_CAPTURE',
-          url: v.url,
+          url: captureUrl,
           label: resLabel,
-          quality: isDirectStream && v.progressive ? undefined : quality,
+          /* Don't send height for HLS — yt-dlp reports 0p and used to fail the job */
+          quality: isHls
+            ? undefined
+            : isDirectStream && v.progressive
+              ? undefined
+              : quality,
           title: safeTitle || title,
           size: Number(v.size) || 0,
           totalBytes: Number(v.size) || 0,
-          format: pinnedFormat || (isDirectStream || v.processor ? '' : v.formatId || ''),
+          format: isHls
+            ? wantTs
+              ? 'ts'
+              : 'mp4'
+            : pinnedFormat || (isDirectStream || v.processor ? '' : v.formatId || ''),
           filename,
           pageUrl,
           referer: pageUrl,
@@ -827,7 +1218,7 @@
             showToast(
               isDirectStream
                 ? `Queued ${resLabel} (fast segmented)`
-                : `Queued ${resLabel || title}`,
+                : `Queued ${safeTitle || resLabel || title}`,
               'success'
             );
           } else if (res && res.ok === false) {
@@ -837,6 +1228,26 @@
       });
       ul.appendChild(li);
     });
+  }
+
+  function bestVideoTitle(hint = '') {
+    const raw =
+      hint ||
+      document.querySelector('meta[property="og:title"]')?.content ||
+      document.querySelector('meta[name="title"]')?.content ||
+      document.querySelector('h1')?.textContent ||
+      document.title ||
+      'Video';
+    let t = String(raw)
+      .replace(/\s*[\|–—]\s*YouTube\s*$/i, '')
+      .replace(/\s+-\s+YouTube\s*$/i, '')
+      .replace(/\s*[\|–—]\s*HDMovies?\s*Stream.*$/i, '')
+      .replace(/\s+Full Movie Online Free.*$/i, '')
+      .replace(/\s*\(\d{4}\)\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (t.length > 90) t = `${t.slice(0, 87)}…`;
+    return t || 'Video';
   }
 
   function closeOpenMenu() {

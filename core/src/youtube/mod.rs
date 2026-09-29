@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,11 +127,31 @@ pub fn is_googlevideo_url(url: &str) -> bool {
     url.contains("googlevideo.com") && url.contains("videoplayback")
 }
 
+/// HLS / DASH manifests — yt-dlp downloads + remuxes these (IDM-style TS/MP4).
+pub fn is_stream_manifest_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = u.path().to_ascii_lowercase();
+    if path.ends_with(".m3u8") || path.ends_with(".mpd") {
+        return true;
+    }
+    let full = url.to_ascii_lowercase();
+    full.contains("m3u8")
+        || full.contains(".mpd")
+        || full.contains("format=m3u8")
+        || full.contains("type=m3u8")
+        || full.contains("application/vnd.apple.mpegurl")
+}
+
 /// Prefer a watch-page URL for yt-dlp. Falls back to `referer` when the
 /// capture URL is a googlevideo CDN stream.
 pub fn resolve_youtube_target(url: &str, referer: Option<&str>) -> Option<String> {
     if is_youtube_page_url(url) {
         return Some(normalize_watch_url(url));
+    }
+    if is_stream_manifest_url(url) {
+        return Some(url.to_string());
     }
     if let Some(r) = referer {
         if is_youtube_page_url(r) && (is_googlevideo_url(url) || url.contains("youtube.com")) {
@@ -188,6 +208,19 @@ pub fn format_selector(opts: &YoutubeOptions) -> String {
     }
 
     "bv*+ba/b".into()
+}
+
+/// Selector for direct HLS/DASH manifests — height filters often report 0p and fail.
+pub fn stream_manifest_selector(opts: &YoutubeOptions) -> String {
+    if let Some(f) = explicit_format_id(opts) {
+        return f;
+    }
+    let q = normalized_quality(opts);
+    if q == "audio" || q == "audio-only" || q == "bestaudio" {
+        return "ba/b".into();
+    }
+    /* Single media playlist is already one quality; master → best ladder entry */
+    "best/b".into()
 }
 
 /// yt-dlp `-S` sort: prefer requested resolution, then bitrate, then mp4-friendly.
@@ -689,7 +722,41 @@ fn write_netscape_cookies(cookies: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Kill yt-dlp and every child it spawned (ffmpeg, fragment workers).
+pub fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 pub async fn probe(url: &str, opts: &YoutubeOptions) -> Result<YoutubeInfo> {
+    probe_cancellable(url, opts, None, None).await
+}
+
+pub async fn probe_cancellable(
+    url: &str,
+    opts: &YoutubeOptions,
+    stop: Option<Arc<AtomicBool>>,
+    pid_slot: Option<Arc<AtomicU32>>,
+) -> Result<YoutubeInfo> {
     let (ytdlp, _) = ensure_tools().await?;
     let target = resolve_youtube_target(url, opts.referer.as_deref())
         .unwrap_or_else(|| url.to_string());
@@ -737,7 +804,37 @@ pub async fn probe(url: &str, opts: &YoutubeOptions) -> Result<YoutubeInfo> {
             }
         }
 
-        let output = cmd.output().await.context("run yt-dlp -J")?;
+        let mut child = cmd.spawn().context("run yt-dlp -J")?;
+        let child_pid = child.id().unwrap_or(0);
+        if let Some(slot) = &pid_slot {
+            slot.store(child_pid, Ordering::Release);
+        }
+        let output = loop {
+            if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                kill_process_tree(child_pid);
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+                if let Some(slot) = &pid_slot {
+                    slot.store(0, Ordering::Release);
+                }
+                if let Some(path) = &cookie_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                bail!("stopped");
+            }
+            match child.try_wait().context("poll yt-dlp probe")? {
+                Some(_) => {
+                    if let Some(slot) = &pid_slot {
+                        slot.store(0, Ordering::Release);
+                    }
+                    break child
+                        .wait_with_output()
+                        .await
+                        .context("read yt-dlp probe output")?;
+                }
+                None => tokio::time::sleep(Duration::from_millis(40)).await,
+            }
+        };
         if let Some(path) = cookie_path {
             let _ = std::fs::remove_file(path);
         }
@@ -1080,6 +1177,7 @@ pub async fn download(
     opts: &YoutubeOptions,
     known_total: Option<u64>,
     stop: Arc<AtomicBool>,
+    pid_slot: Arc<AtomicU32>,
     mut on_progress: impl FnMut(YoutubeProgress),
 ) -> Result<PathBuf> {
     let mut last_err = String::new();
@@ -1092,6 +1190,7 @@ pub async fn download(
             opts,
             known_total,
             Arc::clone(&stop),
+            Arc::clone(&pid_slot),
             &mut on_progress,
             attempt,
         )
@@ -1131,13 +1230,25 @@ async fn download_once(
     opts: &YoutubeOptions,
     known_total: Option<u64>,
     stop: Arc<AtomicBool>,
+    pid_slot: Arc<AtomicU32>,
     on_progress: &mut impl FnMut(YoutubeProgress),
     attempt: u32,
 ) -> Result<PathBuf> {
     let (ytdlp, ffmpeg) = ensure_tools().await?;
     let target = resolve_youtube_target(url, opts.referer.as_deref())
         .unwrap_or_else(|| url.to_string());
-    let selector = format_selector(opts);
+    let is_hls = is_stream_manifest_url(&target);
+    let selector = if is_hls {
+        stream_manifest_selector(opts)
+    } else {
+        format_selector(opts)
+    };
+    /* Container hint from extension (mp4/ts) — not a yt-dlp -f id */
+    let container_hint = opts
+        .format
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| matches!(s.as_str(), "mp4" | "m4v" | "ts" | "mpegts" | "mkv"));
 
     std::fs::create_dir_all(save_dir).context("create save dir")?;
 
@@ -1158,6 +1269,11 @@ async fn download_once(
         .join(format!("{}.%(ext)s", stem))
         .to_string_lossy()
         .to_string();
+    let final_ext = match container_hint.as_deref() {
+        Some("ts") | Some("mpegts") => "ts",
+        Some("mkv") => "mkv",
+        _ => "mp4",
+    };
     let final_hint = preferred_name
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1166,10 +1282,10 @@ async fn download_once(
             if p.extension().is_some() {
                 sanitize_filename(s)
             } else {
-                format!("{}.mp4", sanitize_filename(s))
+                format!("{}.{}", sanitize_filename(s), final_ext)
             }
         })
-        .unwrap_or_else(|| format!("{stem}.mp4"));
+        .unwrap_or_else(|| format!("{stem}.{final_ext}"));
 
     // Extension Cookie headers often break yt-dlp ("page needs to be reloaded").
     // Default clients already expose the full adaptive ladder without cookies.
@@ -1184,27 +1300,33 @@ async fn download_once(
         "{DM_PROG_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s"
     );
 
-    let fragments = opts
-        .concurrent_fragments
-        .unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS)
-        .clamp(1, 32);
+    let fragments = if is_hls {
+        /* Native HLS fragment workers. 32 saturates a typical link without a second merge pass. */
+        opts.concurrent_fragments.unwrap_or(32).clamp(8, 32)
+    } else {
+        opts.concurrent_fragments
+            .unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS)
+            .clamp(1, 16)
+    };
 
-    // Fail closed: refuse to silently download 360p when the user asked for 4K.
-    if let Some(want) = parse_quality_height(&normalized_quality(opts)) {
-        if let Err(e) = assert_selected_height(
-            &ytdlp,
-            &target,
-            &selector,
-            format_sort(opts).as_deref(),
-            want,
-            opts,
-        )
-        .await
-        {
-            if let Some(path) = &cookie_path {
-                let _ = std::fs::remove_file(path);
+    // Fail closed for YouTube only — HLS manifests often report height=0/NA.
+    if !is_hls {
+        if let Some(want) = parse_quality_height(&normalized_quality(opts)) {
+            if let Err(e) = assert_selected_height(
+                &ytdlp,
+                &target,
+                &selector,
+                format_sort(opts).as_deref(),
+                want,
+                opts,
+            )
+            .await
+            {
+                if let Some(path) = &cookie_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(e);
             }
-            return Err(e);
         }
     }
 
@@ -1218,19 +1340,47 @@ async fn download_once(
         // Parallel fragment fetches — same idea as Arroxy/aria2 multi-connection speed.
         .arg("-N")
         .arg(fragments.to_string())
+        .arg("--concurrent-fragments")
+        .arg(fragments.to_string())
         .arg("-f")
         .arg(&selector);
-    if let Some(sort) = format_sort(opts) {
-        cmd.arg("-S").arg(sort);
+    if is_hls {
+        /* Parallel native fragment fetch. ffmpeg-as-downloader is one connection. */
+        cmd.arg("--hls-prefer-native");
+    }
+    if !is_hls {
+        if let Some(sort) = format_sort(opts) {
+            cmd.arg("-S").arg(sort);
+        }
+    }
+    match container_hint.as_deref() {
+        Some("ts") | Some("mpegts") => {
+            cmd.arg("--hls-use-mpegts");
+        }
+        Some("mkv") => {
+            cmd.arg("--merge-output-format").arg("mkv");
+        }
+        _ if is_hls => {
+            /* One ffmpeg stream-copy remux of the fragments into mp4. */
+            cmd.arg("--remux-video").arg("mp4");
+        }
+        Some("mp4") | Some("m4v") => {
+            cmd.arg("--merge-output-format").arg("mp4");
+        }
+        _ => {}
     }
     // Temp intermediates stay in the hidden work dir; final file is moved out after merge.
     cmd.arg("--paths")
         .arg(format!("temp:{}", work_dir.display()))
         .arg("--paths")
-        .arg(format!("home:{}", work_dir.display()))
-        .arg("--merge-output-format")
-        .arg("mp4")
-        .arg("-o")
+        .arg(format!("home:{}", work_dir.display()));
+    /* Default remux to mp4 unless caller asked for TS/MKV (already set above) */
+    if !matches!(container_hint.as_deref(), Some("ts") | Some("mpegts") | Some("mkv"))
+        && !is_hls
+    {
+        cmd.arg("--merge-output-format").arg("mp4");
+    }
+    cmd.arg("-o")
         .arg(&out_tmpl)
         .arg("--print")
         .arg("before_dl:format_id=%(format_id)s height=%(height)s ext=%(ext)s")
@@ -1272,6 +1422,8 @@ async fn download_once(
     );
 
     let mut child = cmd.spawn().context("spawn yt-dlp")?;
+    let child_pid = child.id().unwrap_or(0);
+    pid_slot.store(child_pid, Ordering::Release);
     let stdout = child.stdout.take().context("yt-dlp stdout")?;
     let stderr = child.stderr.take().context("yt-dlp stderr")?;
 
@@ -1319,8 +1471,10 @@ async fn download_once(
 
     let status = loop {
         if stop.load(Ordering::Relaxed) {
+            kill_process_tree(child_pid);
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            pid_slot.store(0, Ordering::Release);
             if let Some(path) = &cookie_path {
                 let _ = std::fs::remove_file(path);
             }
@@ -1454,6 +1608,7 @@ async fn download_once(
             }
         }
     };
+    pid_slot.store(0, Ordering::Release);
 
     // Drain any remaining lines after process exit.
     while let Ok(line) = err_rx.try_recv() {

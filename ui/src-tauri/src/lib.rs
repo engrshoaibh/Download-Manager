@@ -1,4 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -6,26 +9,65 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 fn open_file(path: &str) -> Result<(), String> {
+    let p = path.trim().replace('/', "\\");
+    if p.is_empty() {
+        return Err("Empty path".into());
+    }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer")
-            .arg(path)
+        // `explorer <file>` opens a folder window; use `cmd start` with empty title.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &p])
             .spawn()
             .map_err(|e| e.to_string())?;
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = p;
+        Err("open_file is only implemented on Windows".into())
+    }
 }
 
 #[tauri::command]
 fn open_folder(path: &str) -> Result<(), String> {
+    let p = path.trim().replace('/', "\\");
+    if p.is_empty() {
+        return Err("Empty path".into());
+    }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("explorer")
-            .args(["/select,", path])
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let path_obj = std::path::Path::new(&p);
+        let is_file = path_obj.is_file();
+        if is_file {
+            // Single argv so spaces in the path work: /select,"C:\path\file.ext"
+            let arg = format!("/select,\"{p}\"");
+            std::process::Command::new("explorer")
+                .raw_arg(arg)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        } else {
+            let dir = if path_obj.is_dir() {
+                path_obj.to_path_buf()
+            } else {
+                path_obj
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(path_obj)
+                    .to_path_buf()
+            };
+            std::process::Command::new("explorer")
+                .arg(&dir)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = p;
+        Err("open_folder is only implemented on Windows".into())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

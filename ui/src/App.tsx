@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { join } from '@tauri-apps/api/path'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { DownloadList } from './components/DownloadList'
@@ -11,16 +10,10 @@ import './index.css'
 
 type MenuId = 'file' | 'downloads' | 'view' | 'help' | null
 
-const CATEGORIES: { id: CategoryId; label: string; group: 'queue' | 'type' }[] = [
-  { id: 'all', label: 'All Downloads', group: 'queue' },
-  { id: 'unfinished', label: 'Unfinished', group: 'queue' },
-  { id: 'finished', label: 'Finished', group: 'queue' },
-  { id: 'compressed', label: 'Compressed', group: 'type' },
-  { id: 'documents', label: 'Documents', group: 'type' },
-  { id: 'music', label: 'Music', group: 'type' },
-  { id: 'video', label: 'Video', group: 'type' },
-  { id: 'programs', label: 'Programs', group: 'type' },
-  { id: 'general', label: 'General', group: 'type' },
+const CATEGORIES: { id: CategoryId; label: string }[] = [
+  { id: 'all', label: 'All Downloads' },
+  { id: 'unfinished', label: 'Unfinished' },
+  { id: 'finished', label: 'Finished' },
 ]
 
 const DEFAULT_SEGMENTS_KEY = 'dm.defaultSegments'
@@ -129,7 +122,11 @@ export default function App() {
   }, [filteredJobs])
 
   async function handleAdd(url: string, segments: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) {
-    await addDownload(url, segments, saveDir, quality, filename, totalBytesHint)
+    const result = await addDownload(url, segments, saveDir, quality, filename, totalBytesHint)
+    if (result?.id) {
+      setSelectedIds(new Set([result.id]))
+      setShowProgressId(result.id)
+    }
   }
 
   function stopSelected() {
@@ -164,11 +161,17 @@ export default function App() {
     setShowProgressId(primaryJob.id)
   }
 
+  /** `save_path` from the daemon is already the full file path (dir + filename). */
+  function jobFilePath(job: { save_path: string; filename: string }): string {
+    const p = (job.save_path || '').trim()
+    if (p) return p.replace(/\//g, '\\')
+    return (job.filename || '').trim()
+  }
+
   async function handleOpenFile() {
     if (!primaryJob) return
     try {
-      const fullPath = await join(primaryJob.save_path, primaryJob.filename)
-      await invoke('open_file', { path: fullPath })
+      await invoke('open_file', { path: jobFilePath(primaryJob) })
     } catch (e) {
       console.error(e)
     }
@@ -177,8 +180,7 @@ export default function App() {
   async function handleOpenFolder() {
     if (!primaryJob) return
     try {
-      const fullPath = await join(primaryJob.save_path, primaryJob.filename)
-      await invoke('open_folder', { path: fullPath })
+      await invoke('open_folder', { path: jobFilePath(primaryJob) })
     } catch (e) {
       console.error(e)
     }
@@ -353,7 +355,7 @@ export default function App() {
       <div className="workspace">
         <aside className="category-tree" aria-label="Categories">
           <div className="tree-heading">Categories</div>
-          {CATEGORIES.filter(c => c.group === 'queue').map(cat => (
+          {CATEGORIES.map(cat => (
             <button
               key={cat.id}
               className={`tree-item ${category === cat.id ? 'active' : ''}`}
@@ -457,7 +459,7 @@ export default function App() {
             </div>
             <p className="about-copy">
               A high-performance download manager with parallel segments, HTTP/3, and zero-copy I/O.
-              Layout follows Internet Download Manager: categories, a download list, and a details pane.
+              Double-click a download (or use Properties) for the IDM-style progress dialog.
             </p>
             <div className="modal-footer">
               <button className="btn btn-primary" onClick={() => setShowAbout(false)}>OK</button>
@@ -468,8 +470,14 @@ export default function App() {
 
       {showProgressId && (
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowProgressId(null)}>
-          <div className="modal" style={{ maxWidth: '500px', width: '100%', height: '380px', padding: 0 }} role="dialog" aria-modal="true">
-            <DownloadProgressDialog jobId={showProgressId} onClose={() => setShowProgressId(null)} />
+          <div className="modal modal-progress" role="dialog" aria-modal="true">
+            <DownloadProgressDialog
+              job={jobs.find(j => j.id === showProgressId)}
+              jobId={showProgressId}
+              onClose={() => setShowProgressId(null)}
+              onPause={(id) => { void pauseDownload(id) }}
+              onResume={(id) => { void resumeDownload(id) }}
+            />
           </div>
         </div>
       )}

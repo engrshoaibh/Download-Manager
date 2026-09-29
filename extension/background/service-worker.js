@@ -21,6 +21,10 @@ import {
   guessResolution,
   parseM3u8Master,
   parseM3u8Duration,
+  parseM3u8Media,
+  extrapolatePlaylistBytes,
+  sampleSegmentIndexes,
+  parseHlsAudioGroups,
   parseDashManifest,
   dedupeVariants,
   enrichVariantForMenu,
@@ -28,7 +32,9 @@ import {
   idmDetailLine,
   pageTitleFilename,
   qualityDisplayLabel,
+  heightFromMediaUrl,
   canonicalizeMediaUrl,
+  sanitizeByteLength,
   shouldKeepMediaHit,
   youtubeItagInfo,
   youtubeProcessorVariants,
@@ -418,7 +424,13 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     const url = canonicalizeMediaUrl(raw);
     const yt = youtubeItagInfo(url);
-    const size = yt?.size || len || 0;
+    /* A playlist's own Content-Length is the manifest, not the movie.
+       2^32 here is what the download list showed as 4.0 GB. */
+    const manifest =
+      /\.m3u8(\?|$)/i.test(url) ||
+      /\.mpd(\?|$)/i.test(url) ||
+      /mpegurl|dash\+xml/i.test(mime || '');
+    const size = manifest ? 0 : sanitizeByteLength(yt?.size || len || 0);
     if (!shouldKeepMediaHit(url, size)) return;
 
     rememberTabMedia(details.tabId, {
@@ -433,9 +445,18 @@ chrome.webRequest.onHeadersReceived.addListener(
     });
 
     /* Async-enrich HLS/DASH manifests with IDM-style variant details */
-    if (/\.m3u8(\?|$)/i.test(url) || /mpegurl/i.test(mime || '')) {
+    const looksHls =
+      /\.m3u8(\?|$)/i.test(url) ||
+      /mpegurl/i.test(mime || '') ||
+      /[?&](m3u8|playlist|hls)/i.test(url) ||
+      /\/(hls|playlist|master)(\/|\?|$)/i.test(url);
+    const looksDash =
+      /\.mpd(\?|$)/i.test(url) ||
+      /dash\+xml/i.test(mime || '') ||
+      /[?&]mpd=/i.test(url);
+    if (looksHls) {
       enrichPlaylistIntoTab(details.tabId, url, 'hls').catch(() => {});
-    } else if (/\.mpd(\?|$)/i.test(url) || /dash\+xml/i.test(mime || '')) {
+    } else if (looksDash) {
       enrichPlaylistIntoTab(details.tabId, url, 'dash').catch(() => {});
     }
 
@@ -508,7 +529,16 @@ function rememberTabMedia(tabId, item) {
     ? `${item.url}|${item.container}|${item.quality || ''}`
     : item.url;
   const prev = map.get(key);
-  map.set(key, { ...prev, ...item, ts: Date.now() });
+  const nextSize = sanitizeByteLength(item.size);
+  const prevSize = sanitizeByteLength(prev?.size);
+  const size = nextSize > 0 ? nextSize : prevSize;
+  map.set(key, {
+    ...prev,
+    ...item,
+    size,
+    sizeLabel: size ? item.sizeLabel || prev?.sizeLabel || formatBytes(size) : '',
+    ts: Date.now(),
+  });
   const now = Date.now();
   for (const [u, v] of map) {
     if (now - v.ts > MEDIA_TTL_MS) map.delete(u);
@@ -525,15 +555,31 @@ function listTabMedia(tabId) {
     out.push(item);
   }
   return dedupeVariants(
-    out.map((m) => ({
+    out.map((m) => {
+      const size = sanitizeByteLength(m.size);
+      return {
       url: m.url,
       label: m.label || guessResolution(m),
-      size: m.size || 0,
+      size,
+      sizeLabel: size ? m.sizeLabel || formatBytes(size) : '',
       mime: m.mime || '',
       progressive: !!m.progressive,
       audio: !!m.audio,
-      type: /\.m3u8(\?|$)/i.test(m.url) ? 'hls' : 'file',
-    }))
+      container: m.container || '',
+      ext: m.ext || '',
+      height: m.height || 0,
+      duration: m.duration || 0,
+      bandwidth: m.bandwidth || m.bitrate || 0,
+      type:
+        m.type ||
+        (/\.m3u8(\?|$)/i.test(m.url) || /\/hls\b/i.test(m.url) ? 'hls' : 'file'),
+      detail: idmDetailLine({
+        ...m,
+        size,
+        sizeLabel: size ? formatBytes(size) : '',
+      }),
+    };
+    })
   );
 }
 
@@ -597,6 +643,7 @@ async function handleMessage(msg, sender) {
         return { ok: true, browser: true };
       }
       markRecent(url);
+      const measured = await captureByteLength(url, msg.totalBytes || msg.size || 0);
       const result = await captureToDaemon(url, {
         ...settings,
         segments: msg.segments ?? settings.segments,
@@ -608,14 +655,15 @@ async function handleMessage(msg, sender) {
         label: msg.label || '',
         quality: msg.quality || '',
         format: msg.format || '',
-        totalBytes: msg.totalBytes || msg.size || 0,
-        size: msg.size || msg.totalBytes || 0,
+        totalBytes: measured,
+        size: measured,
       });
       notifyCaptured(url);
       return { ok: true, id: result.id };
     }
 
-    case 'OPEN_CAPTURE':
+    case 'OPEN_CAPTURE': {
+      const measured = await captureByteLength(msg.url, msg.totalBytes || msg.size || 0);
       await openCaptureDialog(msg.url, sender.tab?.id, {
         pageUrl: msg.pageUrl || sender.tab?.url || '',
         referer: msg.referer || sender.tab?.url || '',
@@ -623,10 +671,11 @@ async function handleMessage(msg, sender) {
         filename: msg.filename || '',
         quality: msg.quality || '',
         title: msg.title || '',
-        size: msg.size || msg.totalBytes || 0,
-        totalBytes: msg.totalBytes || msg.size || 0,
+        size: measured,
+        totalBytes: measured,
       });
       return { ok: true };
+    }
 
     case 'GET_YOUTUBE_VARIANTS': {
       const page = msg.pageUrl || sender.tab?.url || '';
@@ -774,23 +823,75 @@ async function handleMessage(msg, sender) {
       return { ok: true, items: listTabMedia(tabId) };
     }
 
+    case 'SNIFF_TAB_NOW': {
+      const tabId = msg.tabId ?? sender.tab?.id;
+      if (tabId == null) return { ok: false };
+      /* Re-notify frames so PerformanceObserver / banners refresh */
+      chrome.tabs.sendMessage(tabId, { type: 'MEDIA_UPDATED' }).catch(() => {});
+      const items = listTabMedia(tabId);
+      /* Kick enrich on any known HLS masters */
+      for (const it of items) {
+        if (/\.m3u8(\?|$)/i.test(it.url) || /\/master\.m3u8/i.test(it.url)) {
+          enrichPlaylistIntoTab(tabId, it.url, 'hls').catch(() => {});
+        }
+      }
+      return { ok: true, items };
+    }
+
     case 'REGISTER_MEDIA': {
       const tabId = sender.tab?.id;
       if (tabId == null || !msg.url) return { ok: false };
+      const url = canonicalizeMediaUrl(msg.url);
+      if (!shouldKeepMediaHit(url, msg.size || 0)) return { ok: true, skipped: true };
+      const manifest = /\.m3u8(\?|$)/i.test(url) || /\.mpd(\?|$)/i.test(url);
       rememberTabMedia(tabId, {
-        url: msg.url,
+        url,
         mime: msg.mime || '',
-        size: msg.size || 0,
+        size: manifest ? 0 : sanitizeByteLength(msg.size),
         width: msg.width || 0,
         height: msg.height || 0,
-        label: msg.label || guessResolution(msg),
+        label: msg.label || guessResolution({ ...msg, url }),
         ts: Date.now(),
       });
+      if (
+        /\.m3u8(\?|$)/i.test(url) ||
+        /[?&](m3u8|playlist|hls)/i.test(url) ||
+        /\/(hls|playlist|master)(\/|\?|$)/i.test(url)
+      ) {
+        enrichPlaylistIntoTab(tabId, url, 'hls').catch(() => {});
+      } else if (/\.mpd(\?|$)/i.test(url) || /[?&]mpd=/i.test(url)) {
+        enrichPlaylistIntoTab(tabId, url, 'dash').catch(() => {});
+      }
+      chrome.tabs.sendMessage(tabId, { type: 'MEDIA_UPDATED' }).catch(() => {});
       return { ok: true };
     }
 
     case 'RESOLVE_VARIANTS': {
-      const variants = await resolveVariants(msg.url, msg.domSources || [], {
+      const tabId = sender.tab?.id;
+      const sniffed = tabId != null ? listTabMedia(tabId) : [];
+      const domSources = [
+        ...(msg.domSources || []),
+        ...sniffed.map((s) => ({
+          url: s.url,
+          label: s.label,
+          width: s.width,
+          height: s.height,
+          size: s.size,
+          duration: s.duration,
+          bandwidth: s.bandwidth,
+          container: s.container,
+          type: s.type,
+        })),
+      ];
+      /* Prefer HLS masters from sniff for variant expansion */
+      let primary = msg.url || '';
+      if (!primary || primary.startsWith('blob:')) {
+        const master = sniffed.find(
+          (s) => /master\.m3u8/i.test(s.url) || (s.type === 'hls' && /\.m3u8/i.test(s.url))
+        );
+        if (master) primary = master.url;
+      }
+      const variants = await resolveVariants(primary, domSources, {
         duration: Number(msg.duration) || 0,
         title: msg.title || '',
       });
@@ -871,6 +972,114 @@ async function resolveVariants(primaryUrl, domSources = [], opts = {}) {
   });
 }
 
+/** One HLS segment is never multi-gigabyte; reject bogus Content-Length (often 2^32). */
+const MAX_SEGMENT_BYTES = 80 * 1024 * 1024;
+
+async function probeContentLength(url, headers) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const accept = (n) => n > 256 && n <= MAX_SEGMENT_BYTES;
+  try {
+    try {
+      const head = await fetch(url, {
+        method: 'HEAD',
+        headers,
+        credentials: 'omit',
+        signal: ctrl.signal,
+      });
+      const n = Number(head.headers.get('content-length') || 0);
+      if (accept(n)) return n;
+    } catch {
+      /* HEAD is often unsupported on segment proxies */
+    }
+    const res = await fetch(url, {
+      headers: { ...headers, Range: 'bytes=0-1' },
+      credentials: 'omit',
+      signal: ctrl.signal,
+    });
+    const cr = res.headers.get('content-range') || '';
+    const m = /\/(\d+)\s*$/.exec(cr);
+    const fromRange = m ? Number(m[1]) : 0;
+    const fromLen = Number(res.headers.get('content-length') || 0);
+    try {
+      await res.body?.cancel();
+    } catch {
+      /* already closed */
+    }
+    if (accept(fromRange)) return fromRange;
+    if (res.status === 200 && accept(fromLen)) return fromLen;
+  } catch {
+    /* timeout or network */
+  } finally {
+    clearTimeout(timer);
+  }
+  return 0;
+}
+
+/** Real playlist size from BYTERANGE sums or sampled segment Content-Length. */
+async function estimatePlaylistBytes(playlistUrl, text, headers) {
+  const parsed = parseM3u8Media(text, playlistUrl);
+  const exact = extrapolatePlaylistBytes(parsed, []);
+  if (exact > 0) {
+    return { bytes: exact, duration: parsed.duration || parseM3u8Duration(text) };
+  }
+  const indexes = sampleSegmentIndexes(parsed.segments.length);
+  const samples = await Promise.all(
+    indexes.map(async (i) => {
+      const seg = parsed.segments[i];
+      const bytes = await probeContentLength(seg.url, headers);
+      return { bytes, duration: seg.duration || 0 };
+    })
+  );
+  let bytes = extrapolatePlaylistBytes(parsed, samples);
+  if (!parsed.mapBytes && parsed.mapUrl) {
+    const mapLen = await probeContentLength(parsed.mapUrl, headers);
+    if (mapLen > 0 && bytes > 0) bytes += mapLen;
+  }
+  return { bytes, duration: parsed.duration || parseM3u8Duration(text) };
+}
+
+function withMeasuredSize(variant, measured, audioBytes) {
+  const dur = measured?.duration || variant.duration || 0;
+  const videoBytes = measured?.bytes || 0;
+  const size = videoBytes > 0 ? videoBytes + (audioBytes || 0) : 0;
+  const bandwidth =
+    size > 0 && dur > 0 ? Math.round((size * 8) / dur) : variant.bandwidth || 0;
+  const base = {
+    ...variant,
+    duration: dur,
+    size,
+    sizeLabel: formatBytes(size),
+    bandwidth,
+    bitrate: bandwidth,
+  };
+  return { ...base, detail: idmDetailLine(base) };
+}
+
+function isHlsCaptureUrl(url) {
+  return (
+    /\.m3u8(\?|$)/i.test(url || '') ||
+    /[?&](m3u8|playlist|hls)/i.test(url || '') ||
+    /\/(hls|playlist|master)(\/|\?|$)/i.test(url || '')
+  );
+}
+
+/** Use a measured playlist size. Never keep a 4.0 GB sentinel or a missing total. */
+async function captureByteLength(url, hinted) {
+  const hintedOk = sanitizeByteLength(hinted);
+  if (!url || !isHlsCaptureUrl(url)) return hintedOk;
+  if (hintedOk > 0) return hintedOk;
+  try {
+    const variants = await fetchM3u8Variants(url, 0);
+    const key = canonicalizeMediaUrl(url);
+    const match = variants.filter((v) => canonicalizeMediaUrl(v.url) === key);
+    const pool = match.length ? match : variants;
+    return pool.reduce((max, v) => Math.max(max, sanitizeByteLength(v.size)), 0);
+  } catch {
+    return 0;
+  }
+}
+
 async function fetchM3u8Variants(url, pageDuration = 0) {
   const cookies = await cookiesForUrl(url);
   const headers = { Accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*' };
@@ -880,51 +1089,63 @@ async function fetchM3u8Variants(url, pageDuration = 0) {
   const text = await res.text();
   if (!text.includes('#EXTM3U')) return [];
 
-  let duration = pageDuration;
   if (!text.includes('#EXT-X-STREAM-INF')) {
-    /* Media playlist — estimate duration from EXTINF */
-    duration = duration || parseM3u8Duration(text);
-    const bandwidth = 0;
-    const base = {
-      url,
-      label: guessResolution({ url }),
-      type: 'hls',
-      duration,
-      bandwidth,
-    };
+    const measured = await estimatePlaylistBytes(url, text, headers);
+    const height = heightFromMediaUrl(url);
+    const base = withMeasuredSize(
+      {
+        url,
+        label: height ? `${height}p` : guessResolution({ url, height }),
+        height,
+        type: 'hls',
+        duration: measured.duration || pageDuration,
+        bandwidth: 0,
+      },
+      measured,
+      0
+    );
     return [
-      {
-        ...base,
-        container: 'TS',
-        ext: 'ts',
-        detail: idmDetailLine({ ...base, container: 'TS' }),
-      },
-      {
-        ...base,
-        container: 'MP4',
-        ext: 'mp4',
-        detail: idmDetailLine({ ...base, container: 'MP4' }),
-      },
+      { ...base, container: 'TS', ext: 'ts', detail: idmDetailLine({ ...base, container: 'TS' }) },
+      { ...base, container: 'MP4', ext: 'mp4', detail: idmDetailLine({ ...base, container: 'MP4' }) },
     ];
   }
 
-  /* Master playlist — fetch first media playlist for duration if needed */
-  const provisional = parseM3u8Master(text, url, {
-    expandContainers: false,
-    duration: 0,
-  });
-  if (!duration && provisional[0]?.url) {
-    try {
-      const mediaRes = await fetch(provisional[0].url, { headers, credentials: 'omit' });
-      if (mediaRes.ok) {
-        duration = parseM3u8Duration(await mediaRes.text()) || duration;
+  const audioGroups = parseHlsAudioGroups(text, url);
+  const audioSizes = new Map();
+  await Promise.all(
+    [...audioGroups.entries()].map(async ([id, mediaUrl]) => {
+      try {
+        const audioRes = await fetch(mediaUrl, { headers, credentials: 'omit' });
+        if (!audioRes.ok) return;
+        const est = await estimatePlaylistBytes(mediaUrl, await audioRes.text(), headers);
+        if (est.bytes > 0) audioSizes.set(id, est.bytes);
+      } catch {
+        /* audio size stays 0; video size is still reported */
       }
-    } catch {
-      /* keep page duration */
-    }
-  }
-  duration = duration || pageDuration;
-  return parseM3u8Master(text, url, { expandContainers: true, duration });
+    })
+  );
+
+  const variants = parseM3u8Master(text, url, {
+    expandContainers: true,
+    duration: pageDuration,
+  });
+  const uniqueUrls = [...new Set(variants.map((v) => v.url).filter(Boolean))];
+  const measured = new Map();
+  await Promise.all(
+    uniqueUrls.map(async (mediaUrl) => {
+      try {
+        const mediaRes = await fetch(mediaUrl, { headers, credentials: 'omit' });
+        if (!mediaRes.ok) return;
+        measured.set(mediaUrl, await estimatePlaylistBytes(mediaUrl, await mediaRes.text(), headers));
+      } catch {
+        /* leave this variant without a guessed size */
+      }
+    })
+  );
+
+  return variants.map((v) =>
+    withMeasuredSize(v, measured.get(v.url), audioSizes.get(v.audioGroup) || 0)
+  );
 }
 
 async function fetchDashVariants(url, pageDuration = 0) {

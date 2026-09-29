@@ -13,7 +13,7 @@ export const STATUS_LABELS: Record<DownloadStatus, string> = {
   cancelled: 'Stopped',
 }
 
-const ROW_HEIGHT = 34
+const ROW_HEIGHT = 42
 /** Virtualize once the list is large enough that DOM cost matters. */
 const VIRTUALIZE_THRESHOLD = 40
 
