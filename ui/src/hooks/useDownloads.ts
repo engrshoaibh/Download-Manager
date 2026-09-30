@@ -33,6 +33,8 @@ export interface DownloadJob {
   use_http3: boolean
   engine?: string
   quality?: string | null
+  /** Why the job failed, when the daemon knows. */
+  error?: string | null
 }
 
 type DmEvent =

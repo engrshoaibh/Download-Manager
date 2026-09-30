@@ -1209,9 +1209,11 @@ fn set_hidden_attr(path: &Path) {
     #[cfg(windows)]
     {
         // `attrib +H` is enough — Explorer hides the folder without needing winapi crates.
+        use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("attrib")
             .arg("+H")
             .arg(path)
+            .creation_flags(0x08000000)
             .status();
     }
     #[cfg(not(windows))]
@@ -1303,6 +1305,8 @@ async fn assert_selected_height(
     }
     // Prefer cookie-less preflight — matches the download path.
 
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
     let output = cmd.output().await.context("yt-dlp format preflight")?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -1601,6 +1605,10 @@ async fn download_once(
         cookie_path.is_some(),
         work_dir.display()
     );
+
+    // The app is a GUI process: without this Windows opens a console for yt-dlp.
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
 
     let mut child = cmd.spawn().context("spawn yt-dlp")?;
     let child_pid = child.id().unwrap_or(0);

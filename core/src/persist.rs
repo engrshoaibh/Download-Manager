@@ -353,6 +353,7 @@ mod tests {
             quality: None,
             format: None,
             engine: "http".into(),
+            error: None,
         }
     }
 

@@ -7,7 +7,8 @@ import { DownloadList } from './components/DownloadList'
 import { DeleteConfirmationModal } from './components/DeleteConfirmationModal'
 import { DownloadProgressDialog } from './components/DownloadProgressDialog'
 import { formatBytes, formatSpeed, matchesCategory, type CategoryId } from './lib/format'
-import { initDeepLinks } from './lib/deepLink'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import { initDeepLinks, isWebsiteUrl } from './lib/deepLink'
 import './index.css'
 
 type MenuId = 'file' | 'downloads' | 'view' | 'help' | null
@@ -48,6 +49,23 @@ export default function App() {
 
   // dmpro:// links from the website
   useEffect(() => initDeepLinks(), [])
+
+  // A download sent by the website brings the window forward (it may be hidden in
+  // the tray). Jobs from the extension or added by hand behave as before.
+  const surfacedJobs = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    for (const job of jobs) {
+      if (surfacedJobs.current.has(job.id)) continue
+      surfacedJobs.current.add(job.id)
+      const ageMs = Date.now() - new Date(job.created_at).getTime()
+      if (!isWebsiteUrl(job.url) || !(ageMs >= 0 && ageMs < 15_000)) continue
+      const win = getCurrentWindow()
+      win.show()
+        .then(() => win.unminimize())
+        .then(() => win.setFocus())
+        .catch(console.error)
+    }
+  }, [jobs])
 
   const activeJobs = jobs.filter(j => j.status === 'downloading' || j.status === 'probing')
   const completedJobs = jobs.filter(j => j.status === 'completed')

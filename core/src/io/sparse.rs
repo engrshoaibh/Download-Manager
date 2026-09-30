@@ -104,6 +104,7 @@ impl PartMetadata {
             quality: None,
             format: None,
             engine: "http".into(),
+            error: None,
         }
     }
 }

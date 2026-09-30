@@ -212,6 +212,18 @@ pub async fn resume_download(
     Path(id): Path<Uuid>,
     State(mgr): State<SharedManager>,
 ) -> impl IntoResponse {
+    // Pause kills yt-dlp, but its run task needs a moment to wind down. Starting the
+    // new run before that made the old task flip the resumed job to "failed".
+    for _ in 0..150 {
+        if !mgr.read().await.previous_run_active(&id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    if mgr.read().await.previous_run_active(&id) {
+        return error::bad_request("Download is still stopping — try again in a moment");
+    }
+
     let (job, client) = {
         let mut m = mgr.write().await;
         match m.begin_resume(&id) {
@@ -265,6 +277,8 @@ fn spawn_job(
                 if j.status != DownloadStatus::Cancelled && j.status != DownloadStatus::Paused {
                     j.status = DownloadStatus::Failed;
                     j.speed_bps = 0.0;
+                    // Keep the reason short enough for a list row / tooltip.
+                    j.error = Some(format!("{e:#}").chars().take(400).collect());
                     Some(j.clone())
                 } else {
                     None

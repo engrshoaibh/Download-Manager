@@ -139,3 +139,23 @@ Checks after installing:
 5. `dmpro://download?url=https://example.com/x.m3u8` does nothing.
 6. Existing flows: a YouTube download, a normal file download, a capture from the
    extension, close-to-tray and second-launch focus all behave as before.
+
+## 0.1.6 fixes (found while testing 0.1.5 with the live site)
+
+- **No console window.** The yt-dlp download, the format preflight and `attrib +H`
+  were started without the "no window" flag, so Windows opened a black console.
+  All three now run hidden (`core/src/youtube/mod.rs`).
+- **Pause then Resume.** Reproduced: after Resume the job showed "Failed" while
+  yt-dlp was in fact still downloading, and it later flipped to "Completed".
+  Pause kills yt-dlp, but the run task needs a moment to finish. Resume reused the
+  same stop flag and reset it, so the old task read its killed yt-dlp as a real
+  failure.
+  - `JobSignal.active_runs` counts live run tasks (`core/src/engine/manager.rs`).
+  - `POST /downloads/:id/resume` now waits (up to 30 s) for the previous run to
+    end before starting the new one (`core/src/api/routes.rs`).
+- **Failure reason.** `DownloadJob` has a new optional `error` field, set when a
+  run fails and cleared on resume. The list shows it as a tooltip on "Failed".
+  The field is left out of the JSON when empty, so older clients are unaffected.
+- **Window comes forward for website downloads.** When a new job's link is on an
+  allowed website host, the main window is shown, un-minimised and focused
+  (`ui/src/App.tsx`). Jobs from the extension or added by hand do not do this.

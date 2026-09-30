@@ -16,6 +16,15 @@ const ALLOWED_ORIGINS = new Set([
   'http://localhost:3000',
 ])
 
+/** True for downloads the website handed over (links on the allowed hosts). */
+export function isWebsiteUrl(url: string): boolean {
+  try {
+    return ALLOWED_ORIGINS.has(new URL(url).origin)
+  } catch {
+    return false
+  }
+}
+
 const DAEMON_WAIT_MS = 20_000
 
 /** A link can arrive twice (startup + event, or React StrictMode) — handle it once. */
