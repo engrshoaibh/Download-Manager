@@ -1351,7 +1351,15 @@ impl DownloadManager {
                 // measured from the segment playlist.
                 let manifest = crate::youtube::is_stream_manifest_url(&j.url);
                 let ignore_estimate = progress.is_estimate && (has_firm_total || manifest);
-                if progress.total_bytes > j.total_bytes && !ignore_estimate {
+                if progress.is_estimate && manifest && !has_firm_total {
+                    // No size was supplied for this stream (e.g. sent by the website).
+                    // yt-dlp's estimate here is measured from the fragments already
+                    // fetched (bytes so far / parts done x total parts), so follow it
+                    // up and down. Without it the job shows "Unknown" and 0%.
+                    if progress.total_bytes > 0 {
+                        j.total_bytes = progress.total_bytes;
+                    }
+                } else if progress.total_bytes > j.total_bytes && !ignore_estimate {
                     j.total_bytes = progress.total_bytes;
                 }
                 // Update downloaded: allow one backward movement at session start

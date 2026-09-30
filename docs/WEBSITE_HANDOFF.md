@@ -183,3 +183,7 @@ and was downloading it, but the app window still showed the old list.
   `--abort-on-unavailable-fragments`, 30 fragment retries with back-off and a
   30 s socket timeout. A job that cannot get every part fails (with its reason)
   and can be resumed.
+- **Size and percentage for website downloads.** Stream jobs sent without a known
+  size showed "Unknown" and 0 %. They now follow yt-dlp's own estimate, which is
+  measured from the fragments already fetched (`core/src/engine/manager.rs`).
+  Jobs that arrive with a size (from the extension) are unchanged.
