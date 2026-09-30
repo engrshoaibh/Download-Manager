@@ -1532,6 +1532,16 @@ async fn download_once(
     if is_hls {
         /* Parallel native fragment fetch. ffmpeg-as-downloader is one connection. */
         cmd.arg("--hls-prefer-native");
+        /* yt-dlp skips fragments it cannot fetch and still reports success, which
+           saved shortened videos. Retry harder, then fail the job so it can be
+           resumed (-c keeps the fragments already downloaded). */
+        cmd.arg("--abort-on-unavailable-fragments")
+            .arg("--fragment-retries")
+            .arg("30")
+            .arg("--retry-sleep")
+            .arg("fragment:exp=1:20")
+            .arg("--socket-timeout")
+            .arg("30");
     }
     if !is_hls {
         if let Some(sort) = format_sort(opts) {

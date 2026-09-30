@@ -177,3 +177,9 @@ and was downloading it, but the app window still showed the old list.
   in `setup` and shows, un-minimises and focuses the main window when the job's
   link is on an allowed website host. This no longer depends on the hidden
   webview processing events.
+- **No more shortened videos.** A stream download was reported "Complete" at
+  50 minutes of a 2 h 08 min film: yt-dlp skips fragments it cannot fetch and
+  still exits successfully. Stream jobs now run with
+  `--abort-on-unavailable-fragments`, 30 fragment retries with back-off and a
+  30 s socket timeout. A job that cannot get every part fails (with its reason)
+  and can be resumed.
