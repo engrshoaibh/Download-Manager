@@ -7,6 +7,7 @@ import { DownloadList } from './components/DownloadList'
 import { DeleteConfirmationModal } from './components/DeleteConfirmationModal'
 import { DownloadProgressDialog } from './components/DownloadProgressDialog'
 import { formatBytes, formatSpeed, matchesCategory, type CategoryId } from './lib/format'
+import { initDeepLinks } from './lib/deepLink'
 import './index.css'
 
 type MenuId = 'file' | 'downloads' | 'view' | 'help' | null
@@ -44,6 +45,9 @@ export default function App() {
   useEffect(() => {
     invoke('setup_native_messaging').catch(console.error)
   }, [])
+
+  // dmpro:// links from the website
+  useEffect(() => initDeepLinks(), [])
 
   const activeJobs = jobs.filter(j => j.status === 'downloading' || j.status === 'probing')
   const completedJobs = jobs.filter(j => j.status === 'completed')

@@ -15,7 +15,7 @@ use crate::network::client::HttpClient;
 use crate::settings::DaemonSettings;
 
 pub async fn health() -> impl IntoResponse {
-    let tools = crate::youtube::tools_health();
+    let tools = crate::youtube::tools_health_cached();
     let status = tools.status.clone();
     let http = match status.as_str() {
         "error" => StatusCode::SERVICE_UNAVAILABLE,

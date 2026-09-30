@@ -80,6 +80,9 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // dmpro:// links from the website (handled in the UI: src/lib/deepLink.ts).
+        // Must come after single-instance so a second launch forwards its link here.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {

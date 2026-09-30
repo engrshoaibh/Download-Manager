@@ -15,6 +15,22 @@ use tracing::{info, warn};
 
 const YT_DLP_RELEASE: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+/// Static FFmpeg build recommended by yt-dlp (contains bin/ffmpeg.exe + ffprobe.exe).
+#[cfg(windows)]
+const FFMPEG_RELEASE_ZIP: &str =
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
+/// `/health` is polled by the UI, the extension and websites — remember the tool scan briefly.
+const HEALTH_CACHE_TTL: Duration = Duration::from_secs(30);
+/// True while a managed FFmpeg download is running (surfaced in `/health`).
+static FFMPEG_FETCHING: AtomicBool = AtomicBool::new(false);
+
+lazy_static::lazy_static! {
+    static ref HEALTH_CACHE: parking_lot::Mutex<Option<(std::time::Instant, ToolsHealth)>> =
+        parking_lot::Mutex::new(None);
+    /// One FFmpeg download at a time, however many stream jobs start together.
+    static ref FFMPEG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+}
+
 /// Machine-readable progress line emitted by yt-dlp (`--progress-template`).
 const DM_PROG_PREFIX: &str = "[DMPROG]";
 const STDERR_TAIL_LINES: usize = 40;
@@ -410,6 +426,25 @@ pub struct ToolsHealth {
     pub message: Option<String>,
 }
 
+/// `tools_health()` with a short cache — the scan runs `where` several times (~1 s).
+pub fn tools_health_cached() -> ToolsHealth {
+    {
+        let guard = HEALTH_CACHE.lock();
+        if let Some((at, health)) = guard.as_ref() {
+            if at.elapsed() < HEALTH_CACHE_TTL {
+                return health.clone();
+            }
+        }
+    }
+    let fresh = tools_health();
+    *HEALTH_CACHE.lock() = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
+fn invalidate_tools_health() {
+    *HEALTH_CACHE.lock() = None;
+}
+
 /// Synchronous path presence check (no process spawn) for `/health`.
 pub fn tools_health() -> ToolsHealth {
     let yt = find_ytdlp();
@@ -435,10 +470,12 @@ pub fn tools_health() -> ToolsHealth {
         None => ToolStatus {
             available: false,
             path: None,
-            error: Some(
+            error: Some(if FFMPEG_FETCHING.load(Ordering::Acquire) {
+                "FFmpeg is downloading…".into()
+            } else {
                 "FFmpeg not found — install ffmpeg or place ffmpeg.exe in %LOCALAPPDATA%\\download-manager\\bin"
-                    .into(),
-            ),
+                    .into()
+            }),
         },
     };
 
@@ -664,6 +701,141 @@ async fn fetch_ytdlp() -> Result<PathBuf> {
         std::fs::rename(&tmp, &dest).context("finalize yt-dlp")?;
     }
     info!("Installed yt-dlp → {}", dest.display());
+    invalidate_tools_health();
+    Ok(dest)
+}
+
+/// Stream manifests (HLS/DASH) need FFmpeg for the final MP4 remux. Returns the
+/// binary already on this machine, or downloads a managed copy into the bin dir.
+/// Only called for stream-manifest jobs — YouTube and plain HTTP jobs are unchanged.
+async fn find_or_fetch_ffmpeg() -> Result<PathBuf> {
+    if let Some(p) = find_ffmpeg() {
+        return Ok(p);
+    }
+    let _guard = FFMPEG_FETCH_LOCK.lock().await;
+    // Another job may have finished the download while we waited.
+    if let Some(p) = find_ffmpeg() {
+        return Ok(p);
+    }
+    FFMPEG_FETCHING.store(true, Ordering::Release);
+    invalidate_tools_health();
+    let result = fetch_ffmpeg().await;
+    FFMPEG_FETCHING.store(false, Ordering::Release);
+    invalidate_tools_health();
+    result
+}
+
+#[cfg(not(windows))]
+async fn fetch_ffmpeg() -> Result<PathBuf> {
+    bail!("FFmpeg not found — install ffmpeg with your package manager")
+}
+
+#[cfg(windows)]
+async fn fetch_ffmpeg() -> Result<PathBuf> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let dir = bin_dir();
+    std::fs::create_dir_all(&dir).context("create bin dir")?;
+    let zip = dir.join("ffmpeg.zip.partial");
+    let unpack = dir.join("ffmpeg-unpack");
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_dir_all(&unpack);
+
+    info!("FFmpeg not found — downloading a managed copy…");
+    let client = reqwest::Client::builder()
+        .user_agent("download-manager/0.1")
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
+    let resp = client
+        .get(FFMPEG_RELEASE_ZIP)
+        .send()
+        .await
+        .context("download ffmpeg")?
+        .error_for_status()
+        .context("ffmpeg HTTP error")?;
+
+    // ~150 MB — stream to disk instead of holding it in memory.
+    let mut total: u64 = 0;
+    {
+        let mut file = tokio::fs::File::create(&zip)
+            .await
+            .context("create ffmpeg zip")?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read ffmpeg body")?;
+            total += chunk.len() as u64;
+            file.write_all(&chunk).await.context("write ffmpeg zip")?;
+        }
+        file.flush().await.context("flush ffmpeg zip")?;
+    }
+    if total < 20_000_000 {
+        let _ = std::fs::remove_file(&zip);
+        bail!("ffmpeg download looks too small ({total} bytes)");
+    }
+
+    // Windows 10+ ships bsdtar, which reads zip archives — no extra dependency.
+    std::fs::create_dir_all(&unpack).context("create ffmpeg unpack dir")?;
+    let mut std_cmd = std::process::Command::new("tar");
+    std_cmd
+        .arg("-xf")
+        .arg(&zip)
+        .arg("-C")
+        .arg(&unpack)
+        .arg("*/bin/ffmpeg.exe")
+        .arg("*/bin/ffprobe.exe")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    {
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(0x08000000);
+    }
+    let mut cmd = Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+    let unpacked = tokio::time::timeout(Duration::from_secs(300), cmd.status()).await;
+    let _ = std::fs::remove_file(&zip);
+    match unpacked {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_dir_all(&unpack);
+            return Err(e).context("run tar to unpack ffmpeg");
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&unpack);
+            bail!("unpacking ffmpeg timed out");
+        }
+    }
+
+    // The archive has one top-level folder: <build-name>/bin/ffmpeg.exe
+    let mut found: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&unpack) {
+        for entry in entries.flatten() {
+            let bin = entry.path().join("bin");
+            if bin.join("ffmpeg.exe").is_file() {
+                found = Some(bin);
+                break;
+            }
+        }
+    }
+    let Some(bin) = found else {
+        let _ = std::fs::remove_dir_all(&unpack);
+        bail!("ffmpeg.exe was not found in the downloaded archive");
+    };
+
+    let dest = dir.join("ffmpeg.exe");
+    for name in ["ffmpeg.exe", "ffprobe.exe"] {
+        let from = bin.join(name);
+        if !from.is_file() {
+            continue;
+        }
+        let to = dir.join(name);
+        let _ = std::fs::remove_file(&to);
+        std::fs::rename(&from, &to).with_context(|| format!("install {name}"))?;
+    }
+    let _ = std::fs::remove_dir_all(&unpack);
+
+    verify_executable(&dest, "ffmpeg").await?;
+    info!("Installed FFmpeg → {}", dest.display());
     Ok(dest)
 }
 
@@ -1234,10 +1406,19 @@ async fn download_once(
     on_progress: &mut impl FnMut(YoutubeProgress),
     attempt: u32,
 ) -> Result<PathBuf> {
-    let (ytdlp, ffmpeg) = ensure_tools().await?;
+    let (ytdlp, mut ffmpeg) = ensure_tools().await?;
     let target = resolve_youtube_target(url, opts.referer.as_deref())
         .unwrap_or_else(|| url.to_string());
     let is_hls = is_stream_manifest_url(&target);
+    // Stream manifests are remuxed to MP4 by FFmpeg; without it the saved ".mp4" is raw
+    // MPEG-TS. Fetch a managed copy on first use. Other job types keep their old behaviour.
+    if is_hls && ffmpeg.is_none() {
+        match tokio::time::timeout(Duration::from_secs(600), find_or_fetch_ffmpeg()).await {
+            Ok(Ok(p)) => ffmpeg = Some(p),
+            Ok(Err(e)) => warn!("FFmpeg auto-download failed ({e:#}) — continuing without it"),
+            Err(_) => warn!("FFmpeg auto-download timed out — continuing without it"),
+        }
+    }
     let selector = if is_hls {
         stream_manifest_selector(opts)
     } else {
