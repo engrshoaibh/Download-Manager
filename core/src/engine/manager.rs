@@ -1329,7 +1329,9 @@ impl DownloadManager {
         // size. Pinning total_bytes to this cap prevents the 1.7 GB → 1.8 GB jump.
         let yt_known_total = known_total;
         // has_firm_total is true whenever we started with any size estimate.
-        let has_firm_total = yt_known_total.is_some();
+        // A total that only came from yt-dlp's running estimate is not firm:
+        // keep following the estimate after Pause/Resume too.
+        let has_firm_total = yt_known_total.is_some() && !job.size_is_estimate;
         let progress_task = tokio::spawn(async move {
             // Allow one backward movement of downloaded_bytes at the very start of
             // a download/resume session. On resume, yt-dlp restarts its internal
@@ -1358,6 +1360,7 @@ impl DownloadManager {
                     // up and down. Without it the job shows "Unknown" and 0%.
                     if progress.total_bytes > 0 {
                         j.total_bytes = progress.total_bytes;
+                        j.size_is_estimate = true;
                     }
                 } else if progress.total_bytes > j.total_bytes && !ignore_estimate {
                     j.total_bytes = progress.total_bytes;

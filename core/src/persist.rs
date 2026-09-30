@@ -354,6 +354,7 @@ mod tests {
             format: None,
             engine: "http".into(),
             error: None,
+            size_is_estimate: false,
         }
     }
 

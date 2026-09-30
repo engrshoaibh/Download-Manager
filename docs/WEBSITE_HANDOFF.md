@@ -187,3 +187,22 @@ and was downloading it, but the app window still showed the old list.
   size showed "Unknown" and 0 %. They now follow yt-dlp's own estimate, which is
   measured from the fragments already fetched (`core/src/engine/manager.rs`).
   Jobs that arrive with a size (from the extension) are unchanged.
+
+## 0.1.8 fixes
+
+Reported: after Pause and Resume a website download started again from zero.
+
+- **Pause keeps the downloaded parts.** `download_once` (`core/src/youtube/mod.rs`)
+  deleted the job's work folder (`.dm-yt/<job id>`) on every stop and on every
+  failure, so yt-dlp's `-c` had nothing to continue from. The folder is now kept
+  on Pause/Stop and on failures other than a merge/FFmpeg failure. Applies to all
+  yt-dlp downloads (website streams and YouTube).
+- Cancel and Delete still remove the folder (`cleanup_yt_temp` in
+  `core/src/engine/manager.rs`).
+- **Correction to 0.1.7:** a job that failed on a missing part could *not* be
+  resumed in 0.1.7; it restarted from zero. It can from 0.1.8.
+- **Percentage after Resume.** `DownloadJob.size_is_estimate` marks a total that
+  came from yt-dlp's running estimate, so a resumed job keeps following it.
+- Checked with the bundled yt-dlp (`-N 32 --hls-prefer-native -c`): killed at
+  part 32 of 100, the second run continued at part 32 and the file had the full
+  duration.

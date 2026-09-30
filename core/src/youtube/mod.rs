@@ -1677,7 +1677,8 @@ async fn download_once(
             if let Some(path) = &cookie_path {
                 let _ = std::fs::remove_file(path);
             }
-            yt_temp.cleanup();
+            // Keep the work dir: Resume continues from these fragments (-c).
+            // Cancel/Delete remove it in the manager (cleanup_yt_temp).
             bail!("stopped");
         }
 
@@ -1835,7 +1836,7 @@ async fn download_once(
         let _ = std::fs::remove_file(path);
     }
     if stop.load(Ordering::Relaxed) {
-        yt_temp.cleanup();
+        // Work dir kept for Resume (see the stop branch above).
         bail!("stopped");
     }
     if !status.success() {
@@ -1854,8 +1855,9 @@ async fn download_once(
                 "workdir_bytes": sum_workdir_bytes(&work_dir),
             }),
         );
-        yt_temp.cleanup();
         if merge {
+            // The retry after a merge failure starts fresh on purpose.
+            yt_temp.cleanup();
             bail!(
                 "yt-dlp/ffmpeg merge failed (exit {status}). stderr tail:\n{}",
                 truncate_for_log(&tail, 2000)
