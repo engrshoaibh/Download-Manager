@@ -86,6 +86,29 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // A download sent by the website brings the window forward, even when
+            // it is hidden in the tray. Done here (not in the UI) so it cannot
+            // depend on the hidden webview processing events.
+            {
+                use tauri::Manager;
+                let handle = app.handle().clone();
+                dm_core::set_job_added_hook(move |url| {
+                    const WEBSITES: [&str; 3] = [
+                        "https://hdmoviesshow.com/",
+                        "https://www.hdmoviesshow.com/",
+                        "http://localhost:3000/",
+                    ];
+                    if !WEBSITES.iter().any(|site| url.starts_with(site)) {
+                        return;
+                    }
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                });
+            }
+
             // Spawn the DM daemon in a background tokio runtime
             std::thread::spawn(|| {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");

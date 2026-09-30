@@ -155,6 +155,7 @@ pub async fn add_download(
     match job_res {
         Ok(job) => {
             let id = job.id.to_string();
+            crate::notify_job_added(&job.url);
             let client = {
                 let m = mgr.read().await;
                 std::sync::Arc::clone(&m.http_client)

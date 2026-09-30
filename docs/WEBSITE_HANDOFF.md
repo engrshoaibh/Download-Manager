@@ -159,3 +159,21 @@ Checks after installing:
 - **Window comes forward for website downloads.** When a new job's link is on an
   allowed website host, the main window is shown, un-minimised and focused
   (`ui/src/App.tsx`). Jobs from the extension or added by hand do not do this.
+
+## 0.1.7 fixes
+
+Reported: the website said "Sent to Download Manager Pro", the daemon had the job
+and was downloading it, but the app window still showed the old list.
+
+- **The list repairs itself.** `ui/src/hooks/useDownloads.ts`:
+  - While the window is hidden, updates are applied on a timer. Paint callbacks
+    (`requestAnimationFrame`) do not fire for a hidden window.
+  - When live events were missed, the list is reloaded over HTTP
+    (`GET /downloads`). A snapshot sent over the socket can itself be dropped
+    from the daemon's bounded queue when the window is behind.
+  - Showing or focusing the window reloads the list.
+- **Window comes forward from the native side.** `dm_core::set_job_added_hook`
+  (`core/src/lib.rs`) is called by `POST /downloads`. The Tauri app registers it
+  in `setup` and shows, un-minimises and focuses the main window when the job's
+  link is on an allowed website host. This no longer depends on the hidden
+  webview processing events.

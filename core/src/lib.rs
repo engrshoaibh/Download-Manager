@@ -9,6 +9,21 @@ pub mod youtube;
 
 pub use engine::manager::DownloadManager;
 
+type JobAddedHook = Box<dyn Fn(&str) + Send + Sync>;
+static JOB_ADDED_HOOK: std::sync::OnceLock<JobAddedHook> = std::sync::OnceLock::new();
+
+/// The desktop app registers this to react to a new download (its URL is passed),
+/// e.g. to bring its window forward. Works even when the UI is hidden in the tray.
+pub fn set_job_added_hook(hook: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = JOB_ADDED_HOOK.set(Box::new(hook));
+}
+
+pub(crate) fn notify_job_added(url: &str) {
+    if let Some(hook) = JOB_ADDED_HOOK.get() {
+        hook(url);
+    }
+}
+
 use anyhow::Result;
 use tracing::{info, warn};
 
