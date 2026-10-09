@@ -36,6 +36,25 @@ pub struct JobSignal {
     pub delete_file: Arc<AtomicBool>,
     /// Live yt-dlp / ffmpeg pid so Stop can kill the process tree immediately.
     pub pid: Arc<AtomicU32>,
+    /// Run tasks currently alive for this job. Resume waits for 0 so a paused run
+    /// that is still shutting down cannot mark the resumed job as failed.
+    pub active_runs: Arc<AtomicU32>,
+}
+
+/// Counts a run task in `JobSignal::active_runs` for as long as it lives.
+struct RunGuard(Arc<AtomicU32>);
+
+impl RunGuard {
+    fn enter(signal: &JobSignal) -> Self {
+        signal.active_runs.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(&signal.active_runs))
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl JobSignal {
@@ -45,6 +64,7 @@ impl JobSignal {
             cancel: Arc::new(AtomicBool::new(false)),
             delete_file: Arc::new(AtomicBool::new(false)),
             pid: Arc::new(AtomicU32::new(0)),
+            active_runs: Arc::new(AtomicU32::new(0)),
         })
     }
 }
@@ -326,6 +346,21 @@ impl DownloadManager {
         self.cancel(id, false)
     }
 
+    /// True while a paused/failed job's previous run task has not finished yet.
+    pub fn previous_run_active(&self, id: &JobId) -> bool {
+        let stopped = self
+            .jobs
+            .get(id)
+            .map(|j| matches!(j.status, DownloadStatus::Paused | DownloadStatus::Failed))
+            .unwrap_or(false);
+        stopped
+            && self
+                .signals
+                .get(id)
+                .map(|s| s.active_runs.load(Ordering::Acquire) > 0)
+                .unwrap_or(false)
+    }
+
     pub fn begin_resume(&mut self, id: &JobId) -> Result<DownloadJob> {
         let job = self
             .jobs
@@ -339,6 +374,7 @@ impl DownloadManager {
         sig.cancel.store(false, Ordering::Release);
         job.status = DownloadStatus::Queued;
         job.speed_bps = 0.0;
+        job.error = None;
         let snapshot = job.clone();
         self.events
             .send(DmEvent::JobUpdated { job: snapshot.clone() });
@@ -363,6 +399,7 @@ impl DownloadManager {
                 .cloned()
                 .unwrap_or_else(JobSignal::new)
         };
+        let _run_guard = RunGuard::enter(&signal);
 
         // Prefer headers stored on the job (needed after restart).
         let user_agent = user_agent.or_else(|| job.user_agent.clone());
@@ -1292,7 +1329,9 @@ impl DownloadManager {
         // size. Pinning total_bytes to this cap prevents the 1.7 GB → 1.8 GB jump.
         let yt_known_total = known_total;
         // has_firm_total is true whenever we started with any size estimate.
-        let has_firm_total = yt_known_total.is_some();
+        // A total that only came from yt-dlp's running estimate is not firm:
+        // keep following the estimate after Pause/Resume too.
+        let has_firm_total = yt_known_total.is_some() && !job.size_is_estimate;
         let progress_task = tokio::spawn(async move {
             // Allow one backward movement of downloaded_bytes at the very start of
             // a download/resume session. On resume, yt-dlp restarts its internal
@@ -1314,7 +1353,16 @@ impl DownloadManager {
                 // measured from the segment playlist.
                 let manifest = crate::youtube::is_stream_manifest_url(&j.url);
                 let ignore_estimate = progress.is_estimate && (has_firm_total || manifest);
-                if progress.total_bytes > j.total_bytes && !ignore_estimate {
+                if progress.is_estimate && manifest && !has_firm_total {
+                    // No size was supplied for this stream (e.g. sent by the website).
+                    // yt-dlp's estimate here is measured from the fragments already
+                    // fetched (bytes so far / parts done x total parts), so follow it
+                    // up and down. Without it the job shows "Unknown" and 0%.
+                    if progress.total_bytes > 0 {
+                        j.total_bytes = progress.total_bytes;
+                        j.size_is_estimate = true;
+                    }
+                } else if progress.total_bytes > j.total_bytes && !ignore_estimate {
                     j.total_bytes = progress.total_bytes;
                 }
                 // Update downloaded: allow one backward movement at session start

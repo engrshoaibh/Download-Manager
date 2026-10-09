@@ -85,6 +85,12 @@ pub struct DownloadJob {
     /// `http` (segmented) or `youtube` (yt-dlp + FFmpeg).
     #[serde(default = "default_engine")]
     pub engine: String,
+    /// Why the job failed (shown in the UI). Cleared on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// `total_bytes` is yt-dlp's running estimate, not a size known up front.
+    #[serde(default)]
+    pub size_is_estimate: bool,
 }
 
 fn default_engine() -> String {
@@ -116,6 +122,8 @@ impl DownloadJob {
             quality: None,
             format: None,
             engine: "http".into(),
+            error: None,
+            size_is_estimate: false,
         }
     }
 

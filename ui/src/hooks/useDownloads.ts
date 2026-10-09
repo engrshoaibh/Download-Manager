@@ -33,6 +33,8 @@ export interface DownloadJob {
   use_http3: boolean
   engine?: string
   quality?: string | null
+  /** Why the job failed, when the daemon knows. */
+  error?: string | null
 }
 
 type DmEvent =
@@ -283,9 +285,13 @@ export function useDownloads() {
 
   const pendingEventsRef = useRef<DmEvent[]>([])
   const flushFrameRef = useRef(0)
+  /** Timer used instead of a paint callback while the window is hidden. */
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   const flushPendingEvents = useCallback(() => {
     flushFrameRef.current = 0
+    clearTimeout(flushTimerRef.current)
+    flushTimerRef.current = undefined
     const batch = pendingEventsRef.current
     if (batch.length === 0) return
     pendingEventsRef.current = []
@@ -296,7 +302,9 @@ export function useDownloads() {
     if (typeof event.seq === 'number') {
       const last = lastSeqRef.current
       if (event.type !== 'snapshot' && last !== null && event.seq > last + 1) {
-        ws.send(JSON.stringify({ type: 'resync' }))
+        // Missed events. Reload the list over HTTP: a snapshot sent over the socket
+        // can itself be dropped when this window is behind (hidden in the tray).
+        void fetchRestSnapshot(ws)
         return
       }
       if (event.type !== 'snapshot' && last !== null && event.seq <= last) {
@@ -311,16 +319,24 @@ export function useDownloads() {
         cancelAnimationFrame(flushFrameRef.current)
         flushFrameRef.current = 0
       }
+      clearTimeout(flushTimerRef.current)
+      flushTimerRef.current = undefined
       const batch = pendingEventsRef.current
       pendingEventsRef.current = []
       setJobs(prev => [...batch, event].reduce((state, ev) => applyJobEvent(state, ev), prev))
       return
     }
     pendingEventsRef.current.push(event)
-    if (!flushFrameRef.current) {
+    // Paint callbacks never fire while the window is hidden — use a timer then,
+    // so the list keeps moving and does not pile up thousands of updates.
+    if (document.hidden) {
+      if (!flushTimerRef.current) {
+        flushTimerRef.current = setTimeout(flushPendingEvents, 500)
+      }
+    } else if (!flushFrameRef.current) {
       flushFrameRef.current = requestAnimationFrame(flushPendingEvents)
     }
-  }, [flushPendingEvents])
+  }, [flushPendingEvents, fetchRestSnapshot])
 
   const connect = useCallback(() => {
     const state = wsRef.current?.readyState
@@ -375,10 +391,33 @@ export function useDownloads() {
       isMountedRef.current = false
       clearTimeout(reconnectTimer.current)
       if (flushFrameRef.current) cancelAnimationFrame(flushFrameRef.current)
+      clearTimeout(flushTimerRef.current)
       fetchGenRef.current += 1
       wsRef.current?.close()
     }
   }, [connect])
+
+  // Opening the window from the tray (or focusing it) reloads the list, so it is
+  // right even if live updates were missed while it was hidden.
+  const lastRefreshRef = useRef(0)
+  useEffect(() => {
+    const refresh = () => {
+      if (document.hidden) return
+      const now = Date.now()
+      if (now - lastRefreshRef.current < 2000) return
+      lastRefreshRef.current = now
+      flushPendingEvents()
+      const ws = wsRef.current
+      if (ws && ws.readyState === WebSocket.OPEN) void fetchRestSnapshot(ws)
+      else connectRef.current()
+    }
+    document.addEventListener('visibilitychange', refresh)
+    window.addEventListener('focus', refresh)
+    return () => {
+      document.removeEventListener('visibilitychange', refresh)
+      window.removeEventListener('focus', refresh)
+    }
+  }, [fetchRestSnapshot, flushPendingEvents])
 
   async function addDownload(url: string, segments?: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) {
     const resp = await fetch(`${DAEMON_URL}/downloads`, {
