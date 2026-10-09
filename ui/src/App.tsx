@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { check } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
 import packageJson from '../package.json'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
@@ -44,6 +46,38 @@ export default function App() {
   useEffect(() => {
     invoke('setup_native_messaging').catch(console.error)
   }, [])
+
+  const checkForUpdates = async () => {
+    try {
+      setUpdateStatus({ state: 'checking', message: 'Checking for updates...' })
+      const update = await check()
+      if (update) {
+        setUpdateStatus({ state: 'available', version: update.version, message: `Version ${update.version} is available!` })
+      } else {
+        setUpdateStatus({ state: 'latest', message: 'You are on the latest version.' })
+      }
+    } catch (error: any) {
+      setUpdateStatus({ state: 'error', message: `Failed to check for updates: ${error.message || error}` })
+    }
+  }
+
+  const installUpdate = async () => {
+    try {
+      setUpdateStatus({ state: 'downloading', message: 'Downloading update...' })
+      const update = await check()
+      if (update) {
+        await update.downloadAndInstall((event) => {
+          if (event.event === 'Progress') {
+            setUpdateStatus({ state: 'downloading', message: `Downloading... ${event.data.chunkLength} bytes received` })
+          }
+        })
+        setUpdateStatus({ state: 'done', message: 'Update installed. Restarting...' })
+        await relaunch()
+      }
+    } catch (error: any) {
+      setUpdateStatus({ state: 'error', message: `Update failed: ${error.message || error}` })
+    }
+  }
 
   const activeJobs = jobs.filter(j => j.status === 'downloading' || j.status === 'probing')
   const completedJobs = jobs.filter(j => j.status === 'completed')
@@ -466,6 +500,23 @@ export default function App() {
               <p>Version: {packageJson.version}</p>
               <p>Publisher: Shoaib Hassan</p>
             </div>
+            
+            <div style={{ marginTop: '1rem', padding: '0.5rem', backgroundColor: 'var(--bg-surface)', borderRadius: '4px' }}>
+              <p style={{ fontSize: '0.85em', marginBottom: '0.5rem' }}>{updateStatus?.message || "Keep your app up to date."}</p>
+              
+              {updateStatus?.state === 'available' ? (
+                <button className="btn btn-primary btn-sm" onClick={installUpdate}>Download & Install</button>
+              ) : (
+                <button 
+                  className="btn btn-secondary btn-sm" 
+                  onClick={checkForUpdates}
+                  disabled={updateStatus?.state === 'checking' || updateStatus?.state === 'downloading'}
+                >
+                  {updateStatus?.state === 'checking' ? 'Checking...' : 'Check for Updates'}
+                </button>
+              )}
+            </div>
+
             <div className="modal-footer">
               <button className="btn btn-primary" onClick={() => setShowAbout(false)}>OK</button>
             </div>
