@@ -1,10 +1,10 @@
-# Download Manager – The Ultimate IDM & Ghost Downloader Alternative
+# Download Manager Pro – The Ultimate IDM & Ghost Downloader Alternative
 
-Welcome to **Download Manager**, an extremely fast, high-performance, and modern open-source download manager designed to replace legacy tools like **IDM (Internet Download Manager)** and serve as a powerful **Ghost Downloader alternative**.
+Welcome to **Download Manager Pro**, an extremely fast, high-performance, and modern open-source download manager designed to replace legacy tools like **IDM (Internet Download Manager)** and serve as a powerful **Ghost Downloader alternative**.
 
 Whether you're downloading massive files over HTTP/HTTPS or fetching high-quality media from YouTube, Download Manager offers blazing-fast speeds, dynamic segmentation, and a sleek, modern UI built with Tauri and React.
 
-## 🚀 Why Choose Download Manager? (The Best IDM Alternative)
+## 🚀 Why Choose Download Manager Pro? (The Best IDM Alternative)
 
 For years, Internet Download Manager (IDM) has been the industry standard, but it has grown bloated, outdated, and restricted to Windows platforms with paid licenses. Ghost Downloader provided a solid free alternative, but it lacks the robust modern UI and seamless browser integration required by today's power users.
 
