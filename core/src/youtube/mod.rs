@@ -981,11 +981,23 @@ pub async fn probe_cancellable(
         if let Some(slot) = &pid_slot {
             slot.store(child_pid, Ordering::Release);
         }
-        let output = loop {
-            if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+        let output = tokio::select! {
+            result = child.wait_with_output() => {
+                if let Some(slot) = &pid_slot {
+                    slot.store(0, Ordering::Release);
+                }
+                result.context("read yt-dlp probe output")?
+            }
+            _ = async {
+                loop {
+                    if stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => {
                 kill_process_tree(child_pid);
                 let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
                 if let Some(slot) = &pid_slot {
                     slot.store(0, Ordering::Release);
                 }
@@ -993,18 +1005,6 @@ pub async fn probe_cancellable(
                     let _ = std::fs::remove_file(path);
                 }
                 bail!("stopped");
-            }
-            match child.try_wait().context("poll yt-dlp probe")? {
-                Some(_) => {
-                    if let Some(slot) = &pid_slot {
-                        slot.store(0, Ordering::Release);
-                    }
-                    break child
-                        .wait_with_output()
-                        .await
-                        .context("read yt-dlp probe output")?;
-                }
-                None => tokio::time::sleep(Duration::from_millis(40)).await,
             }
         };
         if let Some(path) = cookie_path {
