@@ -981,12 +981,35 @@ pub async fn probe_cancellable(
         if let Some(slot) = &pid_slot {
             slot.store(child_pid, Ordering::Release);
         }
+        let mut stdout = child.stdout.take().context("yt-dlp stdout")?;
+        let mut stderr = child.stderr.take().context("yt-dlp stderr")?;
+        
+        let out_handle = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf).await;
+            buf
+        });
+        let err_handle = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
+
         let output = tokio::select! {
-            result = child.wait_with_output() => {
+            status = child.wait() => {
                 if let Some(slot) = &pid_slot {
                     slot.store(0, Ordering::Release);
                 }
-                result.context("read yt-dlp probe output")?
+                let status = status.context("wait yt-dlp")?;
+                let stdout_buf = out_handle.await.unwrap_or_default();
+                let stderr_buf = err_handle.await.unwrap_or_default();
+                std::process::Output {
+                    status,
+                    stdout: stdout_buf,
+                    stderr: stderr_buf,
+                }
             }
             _ = async {
                 loop {
