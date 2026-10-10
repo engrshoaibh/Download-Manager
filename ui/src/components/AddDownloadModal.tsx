@@ -2,9 +2,8 @@ import { useState, useRef, useEffect } from 'react'
 import { formatBytes } from '../lib/format'
 
 interface Props {
-  onAdd: (url: string, segments: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) => Promise<void>
+  onAdd: (url: string, quality?: string, filename?: string, totalBytesHint?: number) => Promise<void>
   onClose: () => void
-  defaultSegments?: number
   initialUrl?: string
   initialFilename?: string
   initialSize?: number
@@ -34,7 +33,6 @@ function isYouTubeUrl(url: string): boolean {
 export function AddDownloadModal({
   onAdd,
   onClose,
-  defaultSegments = 16,
   initialUrl = '',
   initialFilename = '',
   initialSize,
@@ -42,8 +40,6 @@ export function AddDownloadModal({
 }: Props) {
   const [url, setUrl] = useState(initialUrl)
   const [filename, setFilename] = useState(initialFilename)
-  const [segments, setSegments] = useState(defaultSegments)
-  const [saveDir, setSaveDir] = useState('')
   const [quality] = useState(initialQuality)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -61,20 +57,7 @@ export function AddDownloadModal({
     }
   }, [initialUrl])
 
-  async function handleBrowseFolder() {
-    try {
-      // Calling the backend folder selector API we defined
-      const resp = await fetch('http://127.0.0.1:7373/dialog/folder')
-      if (resp.ok) {
-        const { path } = await resp.json()
-        if (path) {
-          setSaveDir(path)
-        }
-      }
-    } catch (e) {
-      console.error(e)
-    }
-  }
+
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -85,8 +68,6 @@ export function AddDownloadModal({
     try {
       await onAdd(
         url.trim(),
-        segments,
-        saveDir.trim() || undefined,
         youtube ? quality : undefined,
         filename.trim() || undefined,
         initialSize
@@ -152,39 +133,7 @@ export function AddDownloadModal({
             />
           </div>
 
-          <div className="form-row">
-            <div className="form-group">
-              <label className="form-label" htmlFor="dl-segments">Segments</label>
-              <input
-                id="dl-segments"
-                className="form-input"
-                type="number"
-                min={1}
-                max={32}
-                value={segments}
-                onChange={e => setSegments(Number(e.target.value))}
-              />
-            </div>
 
-            <div className="form-group">
-              <label className="form-label" htmlFor="dl-savedir">Save folder</label>
-              <div className="input-with-btn">
-                <input
-                  id="dl-savedir"
-                  className="form-input"
-                  type="text"
-                  placeholder="Default downloads"
-                  value={saveDir}
-                  onChange={e => setSaveDir(e.target.value)}
-                />
-                <button type="button" className="icon-btn" onClick={handleBrowseFolder} aria-label="Browse folder">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </div>
 
           {(initialSize || youtube) && (
             <div className="processor-note">

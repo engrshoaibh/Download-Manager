@@ -1,6 +1,6 @@
 [package]
 name = "ui"
-version = "0.1.8"
+version = "0.1.9"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,7 +28,7 @@ winreg = "0.52"
 tauri-plugin-updater = "2.13.0"
 tauri-plugin-process = "2.4.0"
 tauri-plugin-deep-link = "2"
-
+tauri-plugin-dialog = "2.8.1"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -1,7 +1,8 @@
 import { memo, useCallback, useMemo, useRef, useState, useEffect } from 'react'
 import { List, type RowComponentProps } from 'react-window'
 import type { DownloadJob, DownloadStatus } from '../hooks/useDownloads'
-import { formatBytes, formatDate, formatEta, formatSpeed, getFileKind } from '../lib/format'
+import { formatBytes, formatDate, formatEta, formatSpeed } from '../lib/format'
+import { FileIcon } from './FileIcon'
 
 export const STATUS_LABELS: Record<DownloadStatus, string> = {
   queued: 'Queued',
@@ -176,7 +177,6 @@ const DownloadRow = memo(function DownloadRow({
   onShowDetails: (id: string) => void
 }) {
   const pct = job.total_bytes > 0 ? (job.downloaded_bytes / job.total_bytes) * 100 : 0
-  const kind = getFileKind(job.filename)
   const isActive = job.status === 'downloading' || job.status === 'probing'
 
   async function handleDoubleClick() {
@@ -195,7 +195,7 @@ const DownloadRow = memo(function DownloadRow({
       }}
     >
       <span className="col-name">
-        <span className={`file-icon kind-${kind}`} aria-hidden />
+        <FileIcon filename={job.filename} className="file-icon" />
         <span className="file-name" title={job.filename}>{job.filename}</span>
       </span>
       <span className="col-size mono">

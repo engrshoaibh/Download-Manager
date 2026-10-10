@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as R
 import { invoke } from '@tauri-apps/api/core'
 import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
+import { open } from '@tauri-apps/plugin-dialog'
 import packageJson from '../package.json'
 import { useDownloads } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
@@ -22,11 +23,16 @@ const CATEGORIES: { id: CategoryId; label: string }[] = [
 ]
 
 const DEFAULT_SEGMENTS_KEY = 'dm.defaultSegments'
+const DEFAULT_SAVEDIR_KEY = 'dm.defaultSaveDir'
 
 function readDefaultSegments(): number {
   const raw = localStorage.getItem(DEFAULT_SEGMENTS_KEY)
   const n = raw ? Number(raw) : 16
   return Number.isFinite(n) ? Math.min(32, Math.max(1, n)) : 16
+}
+
+function readDefaultSaveDir(): string {
+  return localStorage.getItem(DEFAULT_SAVEDIR_KEY) || ''
 }
 
 export default function App() {
@@ -40,10 +46,19 @@ export default function App() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [openMenu, setOpenMenu] = useState<MenuId>(null)
   const [defaultSegments, setDefaultSegments] = useState(readDefaultSegments)
+  const [defaultSaveDir, setDefaultSaveDir] = useState(readDefaultSaveDir)
   const [showProgressId, setShowProgressId] = useState<string | null>(null)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+  const [searchQuery, setSearchQuery] = useState('')
   const [updateStatus, setUpdateStatus] = useState<{ state: string; version?: string; message?: string } | null>(null)
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('theme') as 'dark' | 'light') || 'dark')
   const menuRef = useRef<HTMLElement>(null)
   const lastClicked = useRef<string | null>(null)
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
 
   useEffect(() => {
     invoke('setup_native_messaging').catch(console.error)
@@ -106,7 +121,11 @@ export default function App() {
   const totalSpeed = activeJobs.reduce((acc, j) => acc + j.speed_bps, 0)
 
   const filteredJobs = useMemo(() => {
-    const list = jobs.filter(j => matchesCategory(j.filename, j.status, category))
+    let list = jobs.filter(j => matchesCategory(j.filename, j.status, category))
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase()
+      list = list.filter(j => (j.filename || '').toLowerCase().includes(q) || (j.url || '').toLowerCase().includes(q))
+    }
     return list.sort((a, b) => {
       const rank = (s: string) =>
         s === 'downloading' ? 0 : s === 'probing' ? 1 : s === 'queued' || s === 'paused' ? 2 : 3
@@ -114,7 +133,7 @@ export default function App() {
       if (d !== 0) return d
       return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     })
-  }, [jobs, category])
+  }, [jobs, category, searchQuery])
 
   const categoryCounts = useMemo(() => {
     const counts = {} as Record<CategoryId, number>
@@ -178,8 +197,8 @@ export default function App() {
     })
   }, [filteredJobs])
 
-  async function handleAdd(url: string, segments: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) {
-    const result = await addDownload(url, segments, saveDir, quality, filename, totalBytesHint)
+  async function handleAdd(url: string, quality?: string, filename?: string, totalBytesHint?: number) {
+    const result = await addDownload(url, defaultSegments, defaultSaveDir || undefined, quality, filename, totalBytesHint)
     if (result?.id) {
       setSelectedIds(new Set([result.id]))
       setShowProgressId(result.id)
@@ -294,6 +313,11 @@ export default function App() {
     localStorage.setItem(DEFAULT_SEGMENTS_KEY, String(n))
   }
 
+  function saveDefaultSaveDir(path: string) {
+    setDefaultSaveDir(path)
+    localStorage.setItem(DEFAULT_SAVEDIR_KEY, path)
+  }
+
   const emptyHint =
     category === 'all'
       ? 'Add a URL from the toolbar, or press Ctrl+N.'
@@ -301,6 +325,47 @@ export default function App() {
 
   return (
     <div className="app">
+      <div data-tauri-drag-region className="titlebar">
+        <div className="titlebar-left">
+          <button className="titlebar-btn sidebar-toggle" onClick={() => setIsSidebarOpen(o => !o)} title="Toggle Sidebar">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+          </button>
+          <span className="titlebar-title" data-tauri-drag-region>Download Manager Pro</span>
+        </div>
+        <div className="titlebar-center" data-tauri-drag-region>
+          <div className="search-bar">
+            <svg className="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input 
+              type="text" 
+              placeholder="Search downloads..." 
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              className="search-input"
+            />
+          </div>
+        </div>
+        <div className="titlebar-right">
+          <div className="titlebar-window-controls">
+            <div className="window-btn theme-btn" onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} title="Toggle Theme">
+              {theme === 'dark' ? (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+              ) : (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+              )}
+            </div>
+            <div className="window-btn minimize" onClick={() => getCurrentWindow().minimize()}>
+              <svg viewBox="0 0 10 10"><path d="M 1,5 L 9,5" stroke="currentColor" strokeWidth="1" strokeLinecap="round"/></svg>
+            </div>
+            <div className="window-btn maximize" onClick={() => getCurrentWindow().toggleMaximize()}>
+              <svg viewBox="0 0 10 10"><rect x="1.5" y="1.5" width="7" height="7" stroke="currentColor" strokeWidth="1" fill="none"/></svg>
+            </div>
+            <div className="window-btn close" onClick={() => getCurrentWindow().close()}>
+              <svg viewBox="0 0 10 10"><path d="M 1,1 L 9,9 M 1,9 L 9,1" stroke="currentColor" strokeWidth="1" strokeLinecap="round"/></svg>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {connection !== 'connected' && (
         <div
           className={`daemon-banner ${connection === 'reconnecting' ? 'reconnecting' : 'disconnected'}`}
@@ -410,7 +475,7 @@ export default function App() {
       </div>
 
       <div className="workspace">
-        <aside className="category-tree" aria-label="Categories">
+        <aside className={`category-tree ${isSidebarOpen ? 'open' : 'collapsed'}`} aria-label="Categories">
           <div className="tree-heading">Categories</div>
           {CATEGORIES.map(cat => (
             <button
@@ -471,7 +536,6 @@ export default function App() {
 
       {showAdd && (
         <AddDownloadModal
-          defaultSegments={defaultSegments}
           onAdd={handleAdd}
           onClose={() => setShowAdd(false)}
         />
@@ -499,6 +563,39 @@ export default function App() {
                 onChange={e => saveDefaultSegments(Number(e.target.value))}
               />
               <span className="form-hint">Used when you add a new URL. Individual downloads can still override this.</span>
+            </div>
+            <div className="form-group">
+              <label className="form-label" htmlFor="opt-savedir">
+                Default save folder
+              </label>
+              <div className="input-with-btn">
+                <input
+                  id="opt-savedir"
+                  className="form-input"
+                  type="text"
+                  placeholder="System Downloads folder"
+                  value={defaultSaveDir}
+                  onChange={e => saveDefaultSaveDir(e.target.value)}
+                />
+                <button type="button" className="icon-btn" onClick={async () => {
+                  try {
+                    const selected = await open({
+                      directory: true,
+                      multiple: false,
+                    })
+                    if (selected && typeof selected === 'string') {
+                      saveDefaultSaveDir(selected)
+                    }
+                  } catch (e) {
+                    console.error('Failed to open dialog:', e)
+                  }
+                }} aria-label="Browse folder">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                  </svg>
+                </button>
+              </div>
+              <span className="form-hint">Used for all new downloads. Leave blank for default Downloads.</span>
             </div>
             <div className="modal-footer">
               <button className="btn btn-primary" onClick={() => setShowSettings(false)}>OK</button>
