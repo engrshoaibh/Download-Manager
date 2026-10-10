@@ -130,7 +130,7 @@ pub fn run() {
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
-            let tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -163,8 +163,7 @@ pub fn run() {
 }
 
 #[tauri::command]
-fn setup_native_messaging(app: tauri::AppHandle) -> Result<String, String> {
-    use std::path::PathBuf;
+fn setup_native_messaging(_app: tauri::AppHandle) -> Result<String, String> {
 
     // We expect dm-native-host.exe to be in the same directory as the executable,
     // or as a sidecar. For simplicity, we assume it's shipped alongside the main executable in release/

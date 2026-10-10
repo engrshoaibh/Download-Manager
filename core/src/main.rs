@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use dm_core::{api, engine, io, network, persist, settings, youtube, updater, DownloadManager};
+use dm_core::{api, persist, youtube, updater, DownloadManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {

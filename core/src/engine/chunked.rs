@@ -1,15 +1,14 @@
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
+use std::path::Path;
+
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, AsyncSeekExt};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::info;
 
-use crate::engine::native_payload::{ExtensionStream, NativeMessagePayload, SessionHeaders};
+use crate::engine::native_payload::{ExtensionStream, SessionHeaders};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkProgress {
@@ -100,7 +99,7 @@ impl ChunkedEngine {
                 let mut req = client.get(&url).headers(req_headers);
                 req = req.header("Range", range);
 
-                let mut resp = req.send().await?;
+                let resp = req.send().await?;
                 if resp.status().as_u16() == 403 {
                     return Err(anyhow::anyhow!("HTTP 403: EXPIRED_URL"));
                 }

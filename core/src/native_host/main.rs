@@ -1,6 +1,5 @@
 use anyhow::Result;
-use dm_core::{engine::manager::DownloadManager, youtube};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::io::{self, Read, Write};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
