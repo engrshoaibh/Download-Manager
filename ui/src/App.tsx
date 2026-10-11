@@ -116,9 +116,18 @@ export default function App() {
     }
   }, [jobs])
 
-  const activeJobs = jobs.filter(j => j.status === 'downloading' || j.status === 'probing')
-  const completedJobs = jobs.filter(j => j.status === 'completed')
-  const totalSpeed = activeJobs.reduce((acc, j) => acc + j.speed_bps, 0)
+  const activeJobs = useMemo(
+    () => jobs.filter(j => j.status === 'downloading' || j.status === 'probing'),
+    [jobs],
+  )
+  const completedJobs = useMemo(
+    () => jobs.filter(j => j.status === 'completed'),
+    [jobs],
+  )
+  const totalSpeed = useMemo(
+    () => activeJobs.reduce((acc, j) => acc + j.speed_bps, 0),
+    [activeJobs],
+  )
 
   const filteredJobs = useMemo(() => {
     let list = jobs.filter(j => matchesCategory(j.filename, j.status, category))

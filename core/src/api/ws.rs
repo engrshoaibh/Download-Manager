@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, warn};
 
-use super::events::{EventPublisher, WsClientMessage, WsMessage, WS_OUTBOUND_CAPACITY};
+use super::events::{EventPublisher, WsBody, WsClientMessage, WsMessage, WS_OUTBOUND_CAPACITY};
 use super::SharedManager;
 
 /// Drive one WS client: initial snapshot, then sequenced deltas.
@@ -182,6 +182,42 @@ async fn enqueue_snapshot(
 }
 
 fn push_drop_oldest(outbound: &mut VecDeque<String>, msg: &WsMessage) {
+    // Collapse pending segment ticks for the same job+segment so a slow UI
+    // never queues hundreds of obsolete progress frames.
+    if let WsBody::SegmentProgress {
+        job_id,
+        segment_id,
+        ..
+    } = &msg.body
+    {
+        outbound.retain(|raw| {
+            match serde_json::from_str::<WsMessage>(raw) {
+                Ok(prev) => !matches!(
+                    &prev.body,
+                    WsBody::SegmentProgress {
+                        job_id: j,
+                        segment_id: s,
+                        ..
+                    } if j == job_id && s == segment_id
+                ),
+                Err(_) => true,
+            }
+        });
+    } else if matches!(&msg.body, WsBody::JobUpdated { .. }) {
+        if let WsBody::JobUpdated { job } = &msg.body {
+            let id = job.id;
+            outbound.retain(|raw| {
+                match serde_json::from_str::<WsMessage>(raw) {
+                    Ok(prev) => !matches!(
+                        &prev.body,
+                        WsBody::JobUpdated { job: j } if j.id == id
+                    ),
+                    Err(_) => true,
+                }
+            });
+        }
+    }
+
     let Ok(json) = serde_json::to_string(msg) else {
         return;
     };

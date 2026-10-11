@@ -37,24 +37,6 @@ const STDERR_TAIL_LINES: usize = 40;
 /// Default interval between yt-dlp self-update checks.
 pub const YTDLP_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
-// #region agent log
-fn agent_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let payload = serde_json::json!({
-        "sessionId": "d4bb81",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": chrono::Utc::now().timestamp_millis(),
-    });
-    let line = payload.to_string();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "{line}");
-    }
-}
-// #endregion
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YoutubeFormat {
@@ -324,17 +306,6 @@ pub async fn ensure_tools() -> Result<(PathBuf, Option<PathBuf>)> {
     } else {
         warn!("FFmpeg not found — DASH audio/video merge may fail");
     }
-    // #region agent log
-    agent_log(
-        "D",
-        "youtube/mod.rs:ensure_tools",
-        "tools resolved",
-        serde_json::json!({
-            "ytdlp": ytdlp.display().to_string(),
-            "ffmpeg": ffmpeg.as_ref().map(|p| p.display().to_string()),
-        }),
-    );
-    // #endregion
     Ok((ytdlp, ffmpeg))
 }
 
@@ -938,7 +909,7 @@ pub async fn probe_cancellable(
     let attempts: &[(bool, &str)] = &[(false, "no_cookies"), (true, "with_cookies")];
     let mut last_err = String::new();
 
-    for (use_cookies, label) in attempts {
+    for (use_cookies, _label) in attempts {
         if *use_cookies && opts.cookies.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
             continue;
         }
@@ -1035,31 +1006,12 @@ pub async fn probe_cancellable(
         }
 
         if output.status.success() {
-            // #region agent log
-            agent_log(
-                "D",
-                "youtube/mod.rs:probe",
-                "probe succeeded",
-                serde_json::json!({ "attempt": label, "target": target }),
-            );
-            // #endregion
             let json: serde_json::Value =
                 serde_json::from_slice(&output.stdout).context("parse yt-dlp JSON")?;
             return parse_info(json, &target);
         }
 
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        // #region agent log
-        agent_log(
-            "D",
-            "youtube/mod.rs:probe",
-            "probe attempt failed",
-            serde_json::json!({
-                "attempt": label,
-                "error": last_err.chars().take(300).collect::<String>(),
-            }),
-        );
-        // #endregion
     }
 
     bail!("yt-dlp probe failed: {last_err}");
@@ -1759,16 +1711,6 @@ async fn download_once(
                         let n = stderr_lines_seen.fetch_add(1, Ordering::Relaxed) + 1;
                         let parsed = parse_progress_line(&line);
                         if n <= 8 || parsed.is_some() || line.contains("ERROR") || line.contains("[Merger]") {
-                            agent_log(
-                                if parsed.is_some() { "A" } else { "B" },
-                                "youtube/mod.rs:stderr",
-                                "stderr line",
-                                serde_json::json!({
-                                    "n": n,
-                                    "attempt": attempt,
-                                    "line": line.chars().take(220).collect::<String>(),
-                                }),
-                            );
                         }
                         if parsed.is_some() {
                             progress_parsed.fetch_add(1, Ordering::Relaxed);
@@ -1865,19 +1807,6 @@ async fn download_once(
     if !status.success() {
         let tail = stderr_tail.iter().cloned().collect::<Vec<_>>().join("\n");
         let merge = is_merge_or_ffmpeg_error(&tail);
-        agent_log(
-            "D",
-            "youtube/mod.rs:download",
-            "yt-dlp failed",
-            serde_json::json!({
-                "status": format!("{status}"),
-                "attempt": attempt,
-                "merge_failure": merge,
-                "stderr_tail": tail.chars().take(1500).collect::<String>(),
-                "progress_parsed": progress_parsed.load(Ordering::Relaxed),
-                "workdir_bytes": sum_workdir_bytes(&work_dir),
-            }),
-        );
         if merge {
             // The retry after a merge failure starts fresh on purpose.
             yt_temp.cleanup();

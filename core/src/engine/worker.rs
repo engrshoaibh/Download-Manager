@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -14,7 +13,6 @@ use crate::settings::BandwidthLimiter;
 
 use super::scheduler::{StealState, MIN_STEAL_BYTES};
 
-const PROGRESS_INTERVAL_MS: u128 = 150;
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Max attempts per chunk (initial try + retries). Exhaustion isolates the
 /// failure — siblings keep running and unfinished bytes stay stealable.
@@ -249,8 +247,6 @@ async fn download_range(
 
     let mut offset = resume_at;
     let mut total_downloaded: u64 = already;
-    let mut last_report = Instant::now();
-    let mut bytes_since_last_report: u64 = 0;
 
     let mut stream = response.bytes_stream();
 
@@ -317,29 +313,17 @@ async fn download_range(
 
         offset += len;
         total_downloaded += len;
-        bytes_since_last_report += len;
 
+        // Atomically publish bytes for the UI tick. Do not flood the event bus —
+        // 16 connections × 150ms was ~100 WS messages/s and froze the app.
         if let Some(state) = steal {
             if let Some(seg) = state.lock().segments.iter().find(|s| s.id == seg_id) {
                 seg.downloaded.store(total_downloaded, Ordering::Relaxed);
             }
         }
-
-        let elapsed = last_report.elapsed();
-        if elapsed.as_millis() >= PROGRESS_INTERVAL_MS {
-            let speed_bps = bytes_since_last_report as f64 / elapsed.as_secs_f64();
-            bytes_since_last_report = 0;
-            last_report = Instant::now();
-
-            tx.send(DmEvent::SegmentProgress {
-                job_id,
-                segment_id: seg_id,
-                downloaded: total_downloaded,
-                speed_bps,
-            });
-        }
     }
 
+    // Final snap so the UI can show the completed segment before the next job tick.
     tx.send(DmEvent::SegmentProgress {
         job_id,
         segment_id: seg_id,

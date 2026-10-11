@@ -26,7 +26,12 @@ const INITIAL_SEGMENT_COUNT: usize = 16;
 const DEFAULT_SEGMENT_COUNT: usize = 32;
 const MAX_SEGMENT_COUNT: usize = 32;
 const MIN_SEGMENT_BYTES: u64 = 256 * 1024;
-const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+/// UI / speed sample cadence. Meta on disk is written less often (see META_EVERY_N).
+const UI_TICK: Duration = Duration::from_millis(500);
+/// Write `.part.meta` every N UI ticks (4s) — resume safety without constant disk I/O.
+const META_EVERY_N: u32 = 8;
+/// Persist job list every N UI ticks (8s).
+const PERSIST_EVERY_N: u32 = 16;
 /// Keep adding connections while marginal throughput gain exceeds this ratio.
 const ADAPTIVE_GAIN_THRESHOLD: f64 = 0.10;
 
@@ -634,9 +639,9 @@ impl DownloadManager {
         let mut last_sample_speed = 0.0f64;
         let mut scaling_enabled = allow_steal && active_connections < max_connections;
         let mut worker_error = None;
-        let mut ticker = tokio::time::interval(CHECKPOINT_INTERVAL);
+        let mut ticker = tokio::time::interval(UI_TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the immediate first tick so the first sample covers a full 2s window.
+        // Skip the immediate first tick so the first sample covers a full UI window.
         ticker.tick().await;
 
         loop {
@@ -772,7 +777,8 @@ impl DownloadManager {
 
                     let downloaded = steal.lock().total_downloaded();
                     let snapshot = steal.lock().snapshot();
-                    {
+                    // Resume metadata is less frequent than UI ticks — avoid disk thrash.
+                    if checkpoint_n % META_EVERY_N == 0 {
                         let meta = PartMetadata::from_job(&meta_job, snapshot.clone());
                         if let Err(e) = write_part_meta_atomic(&meta) {
                             warn!("Checkpoint .part.meta write failed: {e:#}");
@@ -782,10 +788,10 @@ impl DownloadManager {
                         let mut m = mgr.write().await;
                         let updated = if let Some(j) = m.jobs.get_mut(&job_id) {
                             if j.status == DownloadStatus::Downloading {
-                                let elapsed = CHECKPOINT_INTERVAL.as_secs_f64();
+                                let elapsed = UI_TICK.as_secs_f64().max(0.001);
                                 let sample_speed =
                                     (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed;
-                                // Smooth so a quiet 2s window doesn't drop the UI to ~0.
+                                // Smooth so a quiet window doesn't drop the UI to ~0.
                                 j.speed_bps = if j.speed_bps > 1.0 && sample_speed > 0.0 {
                                     j.speed_bps * 0.4 + sample_speed * 0.6
                                 } else if sample_speed > 0.0 {
@@ -819,7 +825,7 @@ impl DownloadManager {
                         } else {
                             None
                         };
-                        if updated.is_some() && checkpoint_n % 4 == 0 {
+                        if updated.is_some() && checkpoint_n % PERSIST_EVERY_N == 0 {
                             m.persist();
                         }
                         if let Some(job) = updated {
@@ -827,9 +833,9 @@ impl DownloadManager {
                         }
                     }
 
-                    let elapsed = CHECKPOINT_INTERVAL.as_secs_f64();
+                    let elapsed = UI_TICK.as_secs_f64().max(0.001);
                     let sample_speed =
-                        (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed.max(0.001);
+                        (downloaded.saturating_sub(last_sample_bytes)) as f64 / elapsed;
 
                     // Adaptive connection scaling: add while marginal gain > ~10%.
                     if scaling_enabled && active_connections < max_connections {
@@ -1116,28 +1122,6 @@ impl DownloadManager {
         let yt_fragments = crate::youtube::DEFAULT_CONCURRENT_FRAGMENTS as usize;
         job.segment_count = yt_fragments;
         update_state(mgr.clone(), job.clone()).await;
-        // #region agent log
-        {
-            let payload = serde_json::json!({
-                "sessionId": "d4bb81",
-                "hypothesisId": "E",
-                "location": "manager.rs:run_youtube_download",
-                "message": "entered youtube path",
-                "data": {
-                    "job_id": job.id.to_string(),
-                    "url": job.url,
-                    "quality": job.quality,
-                    "format": job.format,
-                },
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-            });
-            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                use std::io::Write;
-                let _ = writeln!(f, "{payload}");
-            }
-        }
-        // #endregion
 
         let opts = crate::youtube::YoutubeOptions {
             quality: job.quality.clone(),
@@ -1151,23 +1135,6 @@ impl DownloadManager {
         // Resolve title / duration up front when possible.
         // Ensure tools exist before spending time on probe/download.
         if let Err(e) = crate::youtube::ensure_tools().await {
-            // #region agent log
-            {
-                let payload = serde_json::json!({
-                    "sessionId": "d4bb81",
-                    "hypothesisId": "D",
-                    "location": "manager.rs:ensure_tools",
-                    "message": "ensure_tools failed",
-                    "data": { "error": e.to_string() },
-                    "timestamp": chrono::Utc::now().timestamp_millis(),
-                });
-                let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{payload}");
-                }
-            }
-            // #endregion
             job.status = DownloadStatus::Failed;
             job.speed_bps = 0.0;
             update_state(mgr.clone(), job.clone()).await;
@@ -1223,49 +1190,10 @@ impl DownloadManager {
                         job.total_bytes = est;
                     }
                 }
-                // #region agent log
-                {
-                    let payload = serde_json::json!({
-                        "sessionId": "d4bb81",
-                        "hypothesisId": "D",
-                        "location": "manager.rs:probe",
-                        "message": "probe ok",
-                        "data": {
-                            "title": info.title,
-                            "id": info.id,
-                            "total_bytes": job.total_bytes,
-                            "formats": info.formats.len(),
-                        },
-                        "timestamp": chrono::Utc::now().timestamp_millis(),
-                    });
-                    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{payload}");
-                    }
-                }
-                // #endregion
                 info!("YouTube: {} ({})", info.title, info.id);
             }
             Err(e) => {
                 warn!("YouTube probe failed: {e:#}");
-                // #region agent log
-                {
-                    let payload = serde_json::json!({
-                        "sessionId": "d4bb81",
-                        "hypothesisId": "D",
-                        "location": "manager.rs:probe",
-                        "message": "probe failed",
-                        "data": { "error": e.to_string() },
-                        "timestamp": chrono::Utc::now().timestamp_millis(),
-                    });
-                    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "{payload}");
-                    }
-                }
-                // #endregion
                 job.status = DownloadStatus::Failed;
                 job.speed_bps = 0.0;
                 update_state(mgr.clone(), job.clone()).await;
@@ -1441,7 +1369,7 @@ impl DownloadManager {
                 }
 
                 let phase_changed = progress.phase != last_phase;
-                let due = last_emit.elapsed() >= std::time::Duration::from_millis(200);
+                let due = last_emit.elapsed() >= std::time::Duration::from_millis(400);
                 let snapshot = if phase_changed || due {
                     last_emit = std::time::Instant::now();
                     last_phase = progress.phase.clone();
@@ -1465,35 +1393,6 @@ impl DownloadManager {
             stop,
             Arc::clone(&signal.pid),
             move |progress| {
-                // #region agent log
-                {
-                    static PROG_N: AtomicU64 = AtomicU64::new(0);
-                    let n = PROG_N.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 8 || n % 25 == 0 {
-                        let payload = serde_json::json!({
-                            "sessionId": "d4bb81",
-                            "hypothesisId": "C",
-                            "location": "manager.rs:on_progress",
-                            "message": "progress callback",
-                            "data": {
-                                "n": n,
-                                "percent": progress.percent,
-                                "downloaded": progress.downloaded_bytes,
-                                "total": progress.total_bytes,
-                                "speed": progress.speed_bps,
-                                "phase": progress.phase,
-                            },
-                            "timestamp": chrono::Utc::now().timestamp_millis(),
-                            "runId": "post-fix",
-                        });
-                        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("debug-d4bb81.log");
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                            use std::io::Write;
-                            let _ = writeln!(f, "{payload}");
-                        }
-                    }
-                }
-                // #endregion
                 let _ = prog_tx.send(progress);
             },
         )

@@ -219,6 +219,39 @@ function sortBySeq(events: DmEvent[]): DmEvent[] {
   return [...events].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
 }
 
+/** Collapse noisy progress ticks; preserve order of non-progress events. */
+function coalesceEvents(events: DmEvent[]): DmEvent[] {
+  if (events.length <= 1) return events
+  const out: DmEvent[] = []
+  const segLatest = new Map<string, number>()
+  const jobLatest = new Map<string, number>()
+
+  for (const event of events) {
+    if (event.type === 'segment_progress') {
+      const key = `${event.job_id}:${event.segment_id}`
+      const idx = segLatest.get(key)
+      if (idx != null) out[idx] = event
+      else {
+        segLatest.set(key, out.length)
+        out.push(event)
+      }
+      continue
+    }
+    if (event.type === 'job_updated') {
+      const key = event.job.id
+      const idx = jobLatest.get(key)
+      if (idx != null) out[idx] = event
+      else {
+        jobLatest.set(key, out.length)
+        out.push(event)
+      }
+      continue
+    }
+    out.push(event)
+  }
+  return out
+}
+
 export function useDownloads() {
   const [jobs, setJobs] = useState<Map<string, DownloadJob>>(new Map())
   const [connection, setConnection] = useState<ConnectionState>('connecting')
@@ -295,7 +328,9 @@ export function useDownloads() {
     const batch = pendingEventsRef.current
     if (batch.length === 0) return
     pendingEventsRef.current = []
-    setJobs(prev => batch.reduce((state, event) => applyJobEvent(state, event), prev))
+    // Keep only the latest progress/update per key so a busy download does not
+    // force the React tree through hundreds of intermediate states per frame.
+    setJobs(prev => coalesceEvents(batch).reduce((state, event) => applyJobEvent(state, event), prev))
   }, [])
 
   const handleLiveEvent = useCallback((ws: WebSocket, event: DmEvent) => {
@@ -327,11 +362,15 @@ export function useDownloads() {
       return
     }
     pendingEventsRef.current.push(event)
+    // Hard cap while hidden / backlog — drop oldest progress noise first.
+    if (pendingEventsRef.current.length > 400) {
+      pendingEventsRef.current = coalesceEvents(pendingEventsRef.current).slice(-200)
+    }
     // Paint callbacks never fire while the window is hidden — use a timer then,
     // so the list keeps moving and does not pile up thousands of updates.
     if (document.hidden) {
       if (!flushTimerRef.current) {
-        flushTimerRef.current = setTimeout(flushPendingEvents, 500)
+        flushTimerRef.current = setTimeout(flushPendingEvents, 750)
       }
     } else if (!flushFrameRef.current) {
       flushFrameRef.current = requestAnimationFrame(flushPendingEvents)
