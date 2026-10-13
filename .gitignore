@@ -16,7 +16,6 @@ updater_keys
 updater_keys.pub
 # Rust / Cargo
 core/target/
-ui/src-tauri/target/
 target/
 Cargo.lock
 
@@ -39,3 +38,6 @@ extension/build/
 # Download Manager specific
 *.tmp
 *.crdownload
+
+# Release build output
+release/

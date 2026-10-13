@@ -1,71 +1,52 @@
+# Builds the Rust binaries and packages the release assets into .\release
+# Assets: dm-gui.exe (desktop app), dm-daemon.exe (headless), dm-native-host.exe,
+#         dm-extension.zip, Download-Manager-Pro-windows-x64.zip, SHA256SUMS.txt
 $ErrorActionPreference = 'Stop'
 
-Write-Host "Creating release directory..."
-$ReleaseDir = "$PSScriptRoot\release"
-if (!(Test-Path $ReleaseDir)) {
-    New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
+$Root = $PSScriptRoot
+$ReleaseDir = Join-Path $Root 'release'
+if (Test-Path $ReleaseDir) { Remove-Item $ReleaseDir -Recurse -Force }
+New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
+
+Write-Host 'Building binaries (release)...'
+Push-Location (Join-Path $Root 'core')
+try {
+    # Windows PowerShell 5.1 turns cargo's stderr progress output into errors under 'Stop'.
+    $ErrorActionPreference = 'Continue'
+    cargo build --release --bin dm-gui --bin dm-daemon --bin dm-native-host
+    $buildExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($buildExit -ne 0) { throw "cargo build failed (exit $buildExit)" }
+} finally {
+    Pop-Location
 }
 
-Write-Host "Building core binaries (Release)..."
-Set-Location "$PSScriptRoot\core"
-cargo build --release
-
-Write-Host "Copying core binaries..."
-Copy-Item ".\target\release\dm-daemon.exe" -Destination $ReleaseDir -Force
-Copy-Item ".\target\release\dm-native-host.exe" -Destination $ReleaseDir -Force
-
-Write-Host "Copying core binaries to Tauri app for bundling..."
-Copy-Item ".\target\release\dm-daemon.exe" -Destination "$PSScriptRoot\ui\src-tauri\" -Force
-Copy-Item ".\target\release\dm-native-host.exe" -Destination "$PSScriptRoot\ui\src-tauri\" -Force
-
-Write-Host "Building Tauri UI (Release)..."
-Set-Location "$PSScriptRoot\ui"
-npm install
-npm run tauri build
-
-Write-Host "Copying Tauri installer..."
-# The installer is usually at ui/src-tauri/target/release/bundle/msi/ or nsis/
-$MsiPath = Get-ChildItem -Path ".\src-tauri\target\release\bundle\msi" -Filter "*.msi" -ErrorAction SilentlyContinue
-if ($MsiPath) {
-    Copy-Item $MsiPath.FullName -Destination $ReleaseDir -Force
-}
-$NsisPath = Get-ChildItem -Path ".\src-tauri\target\release\bundle\nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
-if ($NsisPath) {
-    Copy-Item $NsisPath.FullName -Destination $ReleaseDir -Force
+$Target = Join-Path $Root 'core\target\release'
+foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
+    $src = Join-Path $Target $bin
+    if (-not (Test-Path $src)) { throw "Missing build output: $src" }
+    Copy-Item $src -Destination $ReleaseDir -Force
 }
 
-Write-Host "Generating updater.json..."
-$Version = (Get-Content ".\src-tauri\tauri.conf.json" | ConvertFrom-Json).version
-$NsisZip = Get-ChildItem -Path ".\src-tauri\target\release\bundle\nsis" -Filter "*.zip" -ErrorAction SilentlyContinue
-$NsisSig = Get-ChildItem -Path ".\src-tauri\target\release\bundle\nsis" -Filter "*.zip.sig" -ErrorAction SilentlyContinue
+Write-Host 'Packaging browser extension...'
+Compress-Archive -Path (Join-Path $Root 'extension\*') -DestinationPath (Join-Path $ReleaseDir 'dm-extension.zip') -Force
 
-if ($NsisZip -and $NsisSig) {
-    $SigContent = Get-Content $NsisSig.FullName -Raw
-    $FileName = $NsisZip.Name
-    # Ensure URL matches the GitHub Release format (v$Version)
-    $DownloadUrl = "https://github.com/engrshoaibh/Download-Manager/releases/download/v$Version/$FileName"
-    
-    $UpdaterObj = @{
-        version = "v$Version"
-        notes = "Update v$Version is now available!"
-        pub_date = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        platforms = @{
-            "windows-x86_64" = @{
-                signature = $SigContent.Trim()
-                url = $DownloadUrl
-            }
-        }
-    }
-    $UpdaterObj | ConvertTo-Json -Depth 5 | Out-File -FilePath "$ReleaseDir\updater.json" -Encoding utf8
-    
-    # Also copy the zip and sig to release dir so they are uploaded
-    Copy-Item $NsisZip.FullName -Destination $ReleaseDir -Force
-    Copy-Item $NsisSig.FullName -Destination $ReleaseDir -Force
+Write-Host 'Creating portable bundle...'
+$Stage = Join-Path $ReleaseDir 'bundle'
+New-Item -ItemType Directory -Path $Stage | Out-Null
+foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
+    Copy-Item (Join-Path $ReleaseDir $bin) -Destination $Stage
 }
+Copy-Item (Join-Path $ReleaseDir 'dm-extension.zip') -Destination $Stage
+Copy-Item (Join-Path $Root 'LICENSE') -Destination $Stage
+Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath (Join-Path $ReleaseDir 'Download-Manager-Pro-windows-x64.zip') -Force
+Remove-Item $Stage -Recurse -Force
 
-Write-Host "Packaging Extension..."
-Set-Location "$PSScriptRoot\extension"
-Compress-Archive -Path ".\*" -DestinationPath "$ReleaseDir\dm-extension.zip" -Force
+Write-Host 'Writing checksums...'
+Get-ChildItem $ReleaseDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
+    $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+    "$hash  $($_.Name)"
+} | Out-File -FilePath (Join-Path $ReleaseDir 'SHA256SUMS.txt') -Encoding ascii
 
-Set-Location $PSScriptRoot
-Write-Host "Production build complete! Check the 'release' directory."
+Write-Host "Release build complete. Assets in: $ReleaseDir"
+Get-ChildItem $ReleaseDir | Format-Table Name, Length

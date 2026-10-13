@@ -1,58 +1,118 @@
-# Download Manager Pro – The Ultimate IDM & Ghost Downloader Alternative
+# Download Manager Pro – A Fast, Free IDM & Ghost Downloader Alternative
 
-Welcome to **Download Manager Pro**, an extremely fast, high-performance, and modern open-source download manager designed to replace legacy tools like **IDM (Internet Download Manager)** and serve as a powerful **Ghost Downloader alternative**.
+**Download Manager Pro** is a fast, open-source download manager written entirely in **Rust**. It splits files into parallel segments, resumes safely after interruptions, downloads YouTube video and audio, and captures downloads straight from your browser. It is built as a free replacement for **IDM (Internet Download Manager)** and a **Ghost Downloader alternative**.
 
-Whether you're downloading massive files over HTTP/HTTPS or fetching high-quality media from YouTube, Download Manager offers blazing-fast speeds, dynamic segmentation, and a sleek, modern UI built with Tauri and React.
+The desktop app is a native GPU-rendered window (egui), so there is no web view, no Node.js and no background Electron process.
 
-## 🚀 Why Choose Download Manager Pro? (The Best IDM Alternative)
+## 🚀 Why Download Manager Pro?
 
-For years, Internet Download Manager (IDM) has been the industry standard, but it has grown bloated, outdated, and restricted to Windows platforms with paid licenses. Ghost Downloader provided a solid free alternative, but it lacks the robust modern UI and seamless browser integration required by today's power users.
+- **Fast segmented downloads:** files are split into up to 32 parallel connections. When a connection finishes early, it takes over part of the slowest one, so bandwidth stays saturated to the end.
+- **Resume that verifies itself:** progress is saved next to the file (`.part` and `.part.meta`). On resume, the app checks that the saved state still matches the partial file. If either is missing or inconsistent it restarts cleanly instead of producing a corrupt file.
+- **Checked before "complete":** every byte range is verified and the finished file is moved into place before a download is marked done.
+- **YouTube support:** powered by `yt-dlp` and `ffmpeg`, with a quality picker (best, 1080p, 720p, audio only).
+- **Browser extension:** captures downloads and videos from Chrome, Edge and Brave and hands them to the app, including your session cookies for authenticated downloads.
+- **Native, modern interface:** dark and light themes, category sidebar, live progress, search, and a right-click menu on every download. The layout adapts to narrow windows.
+- **Free and open source:** MIT licensed, no licence prompts, no trials.
 
-**Download Manager solves this by offering:**
-- **Blazing Fast Speeds:** Utilizes an advanced Rust-based chunked downloading engine to dynamically segment files (up to 32 concurrent connections), maximizing your bandwidth just like IDM.
-- **100% Free & Open Source:** No annoying license pop-ups, no trial periods, and no hidden telemetry.
-- **Modern UI/UX:** Built with Tauri, React, and Tailwind CSS, featuring a beautiful dark-mode interface, glassmorphism, and smooth animations.
-- **Native YouTube Integration:** Powered by `yt-dlp` under the hood to automatically probe, extract, and download high-quality YouTube videos and audio flawlessly.
-- **Browser Extension Support:** Seamlessly captures downloads from your browser directly into the app.
+## ✨ Features
 
-## ✨ Key Features
-
-- **Dynamic File Segmentation:** Intelligently splits downloads into multiple parts (e.g., 16 or 32 segments) to drastically improve download speeds on throttled networks.
-- **Robust Pause & Resume:** Safely pause your downloads and resume them anytime without data corruption, thanks to a robust `.part` metadata tracking system.
-- **Advanced Network Stack:** Built on `reqwest` and `tokio`, featuring native root certificates for seamless TLS/HTTPS handshakes on modern operating systems.
-- **Adaptive Speed Limiting:** Allows you to cap download speeds globally if you need bandwidth for other applications.
-- **Cross-Platform Foundation:** The core engine is built in Rust, paving the way for seamless operation across Windows, macOS, and Linux.
+| | |
+|---|---|
+| **Segmentation** | Adaptive connection count, work stealing, HTTP/2, native root certificates for HTTPS on Windows |
+| **Pause & resume** | Survives restarts; stale or missing state triggers a clean restart |
+| **Bandwidth control** | Global speed limit and global connection cap |
+| **YouTube** | Video, audio-only, quality selection, DASH merge via ffmpeg |
+| **Browser capture** | Link and download interception, video banner, media grabber, HLS/DASH sniffing |
+| **Local API** | REST and WebSocket server on `127.0.0.1:7373` used by the extension |
+| **Self-update** | Checks GitHub releases and replaces the running executable |
 
 ## 📥 Installation
 
-1. Head over to our [Releases](https://github.com/engrshoaibh/Download-Manager/releases) page.
-2. Download the latest `.exe` (or `.msi`) installer for your platform.
-3. Install and run! The app will run quietly in the background and can be summoned via the system tray.
+1. Open the [Releases](https://github.com/engrshoaibh/Download-Manager/releases) page.
+2. Download `Download-Manager-Pro-windows-x64.zip` and extract it anywhere.
+3. Run `dm-gui.exe`.
+
+The bundle contains:
+
+| File | Purpose |
+|---|---|
+| `dm-gui.exe` | The desktop app (also runs the download engine and local API) |
+| `dm-daemon.exe` | Headless engine with no window, for servers or scripting |
+| `dm-native-host.exe` | Bridge used by the browser extension for video + audio streams |
+| `dm-extension.zip` | The browser extension |
+
+Each release also includes `SHA256SUMS.txt` so you can verify the files.
+
+### Browser extension
+
+1. Extract `dm-extension.zip` to a folder.
+2. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
+3. Click **Load unpacked** and choose that folder.
+4. Keep `dm-gui.exe` running; the extension popup shows **App connected** when it can reach it.
+
+See [extension/README.md](extension/README.md) for details.
+
+### YouTube tips
+
+YouTube sometimes answers yt-dlp with *"Sign in to confirm you're not a bot"*. If that happens, open **Options → YouTube sign-in** and either point to a `cookies.txt` exported from your browser or choose a browser to read cookies from (Firefox works most reliably). Sending the video from the browser extension also works, because it forwards your session cookies. `ffmpeg` must be installed for formats that need audio and video merged.
 
 ## 🛠️ Building from Source
 
-If you want to compile Download Manager yourself, you'll need **Rust**, **Node.js**, and **Tauri CLI**.
+You only need **Rust** (stable).
 
 ```bash
-# Clone the repository
 git clone https://github.com/engrshoaibh/Download-Manager.git
-cd Download-Manager
+cd Download-Manager/core
 
-# Install UI dependencies
-cd ui
-npm install
+# Run the desktop app
+cargo run --bin dm-gui
 
-# Run in development mode
-npm run tauri dev
+# Run the tests
+cargo test
+```
+
+Binaries built from `core/`:
+
+| Binary | Description |
+|---|---|
+| `dm-gui` | Desktop app |
+| `dm-daemon` | Headless engine + API |
+| `dm-native-host` | Browser-extension native messaging host |
+
+To produce the release assets locally (Windows, PowerShell):
+
+```powershell
+.\build_release.ps1   # output goes to .\release
+```
+
+The live YouTube test needs network access, `yt-dlp` and `ffmpeg`, so it is opt-in:
+
+```bash
+cargo test --test youtube_live -- --ignored --nocapture
+```
+
+### Project layout
+
+```
+core/
+  src/engine/     download engine: segments, work stealing, integrity checks, chunked streams
+  src/network/    HTTP client and probing
+  src/io/         sparse files, memory-mapped writes, resume metadata
+  src/youtube/    yt-dlp / ffmpeg integration
+  src/api/        REST + WebSocket server for the extension
+  src/gui_*.rs    egui desktop app
+  tests/          end-to-end download tests against a local server
+extension/        Chrome / Edge / Brave extension
+branding/         app icon
 ```
 
 ## 🤝 Contributing
 
-We welcome contributions! If you want to help make this the best IDM alternative in the world, feel free to fork the repository, open issues, and submit pull requests.
+Contributions are welcome. Fork the repository, open issues, and submit pull requests. Please run `cargo test` before sending a change.
 
 ## 📝 License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
+Released under the MIT License. See [LICENSE](LICENSE).
 
 ---
-*Keywords for search visibility: Free IDM alternative, Internet Download Manager replacement, Ghost Downloader alternative, open source download manager, fast download manager, Rust download manager, YouTube video downloader.*
+*Keywords: free IDM alternative, Internet Download Manager replacement, Ghost Downloader alternative, open source download manager, fast download manager, Rust download manager, YouTube video downloader.*
