@@ -37,17 +37,6 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-/// Release asset matching the running executable (`dm-gui`, falling back to `dm-daemon`).
-fn own_asset_name() -> String {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let stem = env::current_exe()
-        .ok()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_default();
-    let base = if stem == "dm-gui" { "dm-gui" } else { "dm-daemon" };
-    format!("{base}{ext}")
-}
-
 pub fn get_status() -> UpdateStatus {
     UPDATE_STATUS.read().clone()
 }
@@ -61,12 +50,41 @@ fn set_status(state: &str, version: Option<String>, message: Option<String>) {
     status.message = message;
 }
 
+/// When set (the desktop app), a downloaded update waits for the user to click "Restart";
+/// otherwise (headless daemon) the installer is launched as soon as it is verified.
+static USER_CONFIRMS_INSTALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Path of a downloaded, checksum-verified installer waiting to be launched.
+static STAGED_INSTALLER: parking_lot::Mutex<Option<std::path::PathBuf>> = parking_lot::Mutex::new(None);
+
+/// Make updates wait for the user instead of restarting the app on their own.
+pub fn require_user_confirmation() {
+    USER_CONFIRMS_INSTALL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+const INSTALLER_PREFIX: &str = "DownloadManagerPro-Setup";
+
+/// Find `<hash>  <name>` for `name` in a `sha256sum`-style listing.
+fn checksum_for(listing: &str, name: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (hash, file) = line.split_once(char::is_whitespace)?;
+        (file.trim().trim_start_matches('*') == name).then(|| hash.trim().to_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Check GitHub for a newer release and download its installer. Returns `true` when a
+/// verified installer has been staged (and launched, if no user confirmation is required).
 pub async fn check_and_apply_update() -> Result<bool> {
     set_status("checking", None, None);
 
     let client = reqwest::Client::builder()
-        .user_agent("dm-daemon-updater/0.1")
-        .timeout(Duration::from_secs(30))
+        .user_agent("download-manager-updater/0.2")
+        .timeout(Duration::from_secs(120))
         .build()?;
 
     let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
@@ -76,67 +94,87 @@ pub async fn check_and_apply_update() -> Result<bool> {
         Err(e) => bail!("Failed to fetch release info: {}", e),
     };
 
-    let latest_version = release.tag_name.trim_start_matches('v');
+    let latest_version = release.tag_name.trim_start_matches('v').to_string();
     if latest_version == APP_VERSION {
         set_status("up_to_date", Some(APP_VERSION.to_string()), Some("You are on the latest version".into()));
         return Ok(false);
     }
+    if STAGED_INSTALLER.lock().is_some() {
+        return Ok(true);
+    }
 
-    // Update whichever binary is running (dm-gui or dm-daemon), never swap one for the other.
-    let asset_name = own_asset_name();
-    let asset = release.assets.iter().find(|a| a.name == asset_name);
-
-    let download_url = match asset {
-        Some(a) => &a.browser_download_url,
-        None => {
-            let msg = format!("Release {} does not contain asset {}", latest_version, asset_name);
+    let installer = release
+        .assets
+        .iter()
+        .find(|a| a.name.starts_with(INSTALLER_PREFIX) && a.name.ends_with(".exe"));
+    let installer = match installer {
+        Some(a) if cfg!(windows) => a,
+        _ => {
+            let msg = format!("Release {latest_version} has no installer for this platform");
             set_status("error", None, Some(msg.clone()));
             bail!(msg);
         }
     };
+    let sums = release.assets.iter().find(|a| a.name == "SHA256SUMS.txt");
+    let Some(sums) = sums else {
+        set_status("error", None, Some("Release has no SHA256SUMS.txt".into()));
+        bail!("Release has no SHA256SUMS.txt - refusing to run an unverified installer");
+    };
 
-    set_status("downloading", Some(latest_version.to_string()), Some(format!("Downloading {}", latest_version)));
+    set_status("downloading", Some(latest_version.clone()), Some(format!("Downloading {latest_version}")));
 
-    let bytes = client.get(download_url).send().await?.error_for_status()?.bytes().await?;
-    
+    let listing = client.get(&sums.browser_download_url).send().await?.error_for_status()?.text().await?;
+    let expected = checksum_for(&listing, &installer.name)
+        .with_context(|| format!("{} is not listed in SHA256SUMS.txt", installer.name))?;
+
+    let bytes = client.get(&installer.browser_download_url).send().await?.error_for_status()?.bytes().await?;
     if bytes.len() < 1_000_000 {
-        set_status("error", None, Some("Downloaded binary is too small".into()));
-        bail!("Downloaded binary looks too small");
+        set_status("error", None, Some("Downloaded installer is too small".into()));
+        bail!("Downloaded installer looks too small");
+    }
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        set_status("error", None, Some("Installer checksum mismatch".into()));
+        bail!("Installer checksum mismatch (expected {expected}, got {actual})");
     }
 
-    let current_exe = env::current_exe().context("Failed to get current executable path")?;
-    let dir = current_exe.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let tmp = dir.join(format!("{}.partial", asset_name));
-    let bak = dir.join(format!("{}.bak", asset_name));
+    let dir = env::temp_dir().join("download-manager-update");
+    std::fs::create_dir_all(&dir).context("create update dir")?;
+    let path = dir.join(&installer.name);
+    std::fs::write(&path, &bytes).context("write installer")?;
+    *STAGED_INSTALLER.lock() = Some(path);
 
-    if tmp.exists() {
-        let _ = std::fs::remove_file(&tmp);
+    set_status(
+        "ready_to_restart",
+        Some(latest_version.clone()),
+        Some(format!("Version {latest_version} is ready to install")),
+    );
+    info!("Update {latest_version} downloaded and verified");
+
+    if !USER_CONFIRMS_INSTALL.load(std::sync::atomic::Ordering::Relaxed) {
+        launch_staged_installer()?;
     }
-
-    std::fs::write(&tmp, &bytes).context("Failed to write partial binary")?;
-    
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&tmp)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perms)?;
-    }
-
-    if current_exe.exists() {
-        let _ = std::fs::remove_file(&bak);
-        std::fs::rename(&current_exe, &bak).context("Failed to rename current executable to .bak")?;
-    }
-
-    if let Err(e) = std::fs::rename(&tmp, &current_exe) {
-        let _ = std::fs::rename(&bak, &current_exe);
-        set_status("error", None, Some("Failed to replace binary".into()));
-        bail!("Failed to replace binary: {}", e);
-    }
-
-    set_status("ready_to_restart", Some(latest_version.to_string()), Some("Update applied, please restart".into()));
-    info!("Update successfully applied: version {}", latest_version);
     Ok(true)
+}
+
+/// Run the staged installer silently; it closes this app, upgrades in place and restarts it.
+/// The caller should exit right after.
+pub fn launch_staged_installer() -> Result<()> {
+    let path = STAGED_INSTALLER
+        .lock()
+        .clone()
+        .context("no update has been downloaded")?;
+    let mut cmd = std::process::Command::new(&path);
+    cmd.args(["/SILENT", "/NORESTART", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so the installer outlives us.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    cmd.spawn().context("start installer")?;
+    set_status("installing", None, Some("Installing update...".into()));
+    Ok(())
 }
 
 pub fn spawn_auto_updater(interval: Duration) {
@@ -155,14 +193,34 @@ pub fn spawn_auto_updater(interval: Duration) {
     });
 }
 
+/// Remove leftovers from the old in-place updater and from a finished installer run.
 pub fn cleanup_bak() {
     if let Ok(current_exe) = env::current_exe() {
         if let Some(dir) = current_exe.parent() {
-            let asset_name = own_asset_name();
-            let bak = dir.join(format!("{}.bak", asset_name));
-            if bak.exists() {
-                let _ = std::fs::remove_file(&bak);
+            for name in ["dm-gui.exe.bak", "dm-daemon.exe.bak", "dm-gui.exe.partial", "dm-daemon.exe.partial"] {
+                let _ = std::fs::remove_file(dir.join(name));
             }
         }
+    }
+    let _ = std::fs::remove_dir_all(env::temp_dir().join("download-manager-update"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_checksum_by_file_name() {
+        let listing = "aaa111  dm-extension.zip\nBBB222 *DownloadManagerPro-Setup-0.1.16.exe\n";
+        assert_eq!(checksum_for(listing, "DownloadManagerPro-Setup-0.1.16.exe").as_deref(), Some("bbb222"));
+        assert_eq!(checksum_for(listing, "missing.exe"), None);
+    }
+
+    #[test]
+    fn sha256_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

@@ -1,12 +1,18 @@
-# Builds the Rust binaries and packages the release assets into .\release
-# Assets: dm-gui.exe (desktop app), dm-daemon.exe (headless), dm-native-host.exe,
-#         dm-extension.zip, Download-Manager-Pro-windows-x64.zip, SHA256SUMS.txt
+# Builds the Rust binaries and packages ONE standalone installer into .\release
+# Output: DownloadManagerPro-Setup-<version>.exe  +  SHA256SUMS.txt (used by the in-app updater)
+# Requires Inno Setup 6 (ISCC.exe) - preinstalled on GitHub's windows runners,
+# locally:  winget install JRSoftware.InnoSetup
 $ErrorActionPreference = 'Stop'
 
 $Root = $PSScriptRoot
 $ReleaseDir = Join-Path $Root 'release'
 if (Test-Path $ReleaseDir) { Remove-Item $ReleaseDir -Recurse -Force }
 New-Item -ItemType Directory -Path $ReleaseDir | Out-Null
+
+# Version comes from the crate so the installer, the app and the updater always agree.
+$Version = (Select-String -Path (Join-Path $Root 'core\Cargo.toml') -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+if (-not $Version) { throw 'Could not read version from core/Cargo.toml' }
+Write-Host "Version: $Version"
 
 Write-Host 'Building binaries (release)...'
 Push-Location (Join-Path $Root 'core')
@@ -21,32 +27,35 @@ try {
     Pop-Location
 }
 
-$Target = Join-Path $Root 'core\target\release'
 foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
-    $src = Join-Path $Target $bin
-    if (-not (Test-Path $src)) { throw "Missing build output: $src" }
-    Copy-Item $src -Destination $ReleaseDir -Force
+    if (-not (Test-Path (Join-Path $Root "core\target\release\$bin"))) { throw "Missing build output: $bin" }
 }
 
-Write-Host 'Packaging browser extension...'
-Compress-Archive -Path (Join-Path $Root 'extension\*') -DestinationPath (Join-Path $ReleaseDir 'dm-extension.zip') -Force
-
-Write-Host 'Creating portable bundle...'
-$Stage = Join-Path $ReleaseDir 'bundle'
-New-Item -ItemType Directory -Path $Stage | Out-Null
-foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
-    Copy-Item (Join-Path $ReleaseDir $bin) -Destination $Stage
+Write-Host 'Locating Inno Setup...'
+$Iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+if (-not $Iscc) {
+    $candidates = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )
+    $Iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
-Copy-Item (Join-Path $ReleaseDir 'dm-extension.zip') -Destination $Stage
-Copy-Item (Join-Path $Root 'LICENSE') -Destination $Stage
-Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath (Join-Path $ReleaseDir 'Download-Manager-Pro-windows-x64.zip') -Force
-Remove-Item $Stage -Recurse -Force
+if (-not $Iscc) { throw 'Inno Setup not found. Install it with: winget install JRSoftware.InnoSetup' }
+
+Write-Host 'Building installer...'
+$ErrorActionPreference = 'Continue'
+& $Iscc "/DAppVersion=$Version" "/DSourceDir=$Root" "/DOutputDir=$ReleaseDir" (Join-Path $Root 'installer\DownloadManagerPro.iss')
+$isccExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($isccExit -ne 0) { throw "Inno Setup failed (exit $isccExit)" }
+
+$Installer = Get-ChildItem $ReleaseDir -Filter 'DownloadManagerPro-Setup-*.exe' | Select-Object -First 1
+if (-not $Installer) { throw 'Installer was not produced' }
 
 Write-Host 'Writing checksums...'
-Get-ChildItem $ReleaseDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
-    $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-    "$hash  $($_.Name)"
-} | Out-File -FilePath (Join-Path $ReleaseDir 'SHA256SUMS.txt') -Encoding ascii
+$hash = (Get-FileHash $Installer.FullName -Algorithm SHA256).Hash.ToLower()
+"$hash  $($Installer.Name)" | Out-File -FilePath (Join-Path $ReleaseDir 'SHA256SUMS.txt') -Encoding ascii
 
-Write-Host "Release build complete. Assets in: $ReleaseDir"
+Write-Host "Release build complete: $($Installer.FullName)"
 Get-ChildItem $ReleaseDir | Format-Table Name, Length

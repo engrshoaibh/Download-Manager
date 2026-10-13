@@ -77,6 +77,7 @@ dirs = "5"
 
 # Atomic operations for shared state
 parking_lot = "0.12"
+sha2 = "0.10"
 
 # Async streams for response body iteration
 async-stream = "0.3"

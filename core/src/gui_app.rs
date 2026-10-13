@@ -920,6 +920,18 @@ impl eframe::App for NativeApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let update = dm_core::updater::get_status();
+                        if update.state == "ready_to_restart" {
+                            let label = format!("Update {} - Restart", update.version.as_deref().unwrap_or(""));
+                            if icon_text_button(ui, Icon::Download, &label, Color32::WHITE, c.success, c.success.gamma_multiply(0.85), Stroke::NONE, 32.0)
+                                .on_hover_text("Install the downloaded update and restart")
+                                .clicked()
+                                && dm_core::updater::launch_staged_installer().is_ok()
+                            {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            ui.add_space(6.0);
+                        }
                         let theme_icon = if self.theme == ThemeMode::Light { Icon::Moon } else { Icon::Sun };
                         if icon_button(ui, &c, theme_icon, "Toggle light/dark theme").clicked() {
                             self.theme = if self.theme == ThemeMode::Light { ThemeMode::Dark } else { ThemeMode::Light };

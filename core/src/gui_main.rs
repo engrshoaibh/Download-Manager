@@ -20,6 +20,8 @@ fn main() -> eframe::Result<()> {
     let _enter = rt.enter();
 
     updater::cleanup_bak();
+    // Updates wait for the user to click "Restart" instead of closing the app mid-download.
+    updater::require_user_confirmation();
 
     // Load or initialize manager
     let manager = DownloadManager::load_or_new();

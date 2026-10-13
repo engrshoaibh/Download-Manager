@@ -29,26 +29,18 @@ The desktop app is a native GPU-rendered window (egui), so there is no web view,
 ## 📥 Installation
 
 1. Open the [Releases](https://github.com/engrshoaibh/Download-Manager/releases) page.
-2. Download `Download-Manager-Pro-windows-x64.zip` and extract it anywhere.
-3. Run `dm-gui.exe`.
+2. Download `DownloadManagerPro-Setup-<version>.exe` and run it.
+3. Finish the wizard and launch **Download Manager Pro**.
 
-The bundle contains:
+The installer is a single file. It installs per user (no administrator prompt) to `%LOCALAPPDATA%\Programs\Download Manager Pro`, adds a Start menu entry (and optionally a desktop shortcut or start-with-Windows), and registers an uninstaller. Upgrades install over the top: run a newer installer, or click **Update - Restart** in the app when a new version has been downloaded. Updates are verified against the release's `SHA256SUMS.txt` before they run.
 
-| File | Purpose |
-|---|---|
-| `dm-gui.exe` | The desktop app (also runs the download engine and local API) |
-| `dm-daemon.exe` | Headless engine with no window, for servers or scripting |
-| `dm-native-host.exe` | Bridge used by the browser extension for video + audio streams |
-| `dm-extension.zip` | The browser extension |
-
-Each release also includes `SHA256SUMS.txt` so you can verify the files.
+It installs `dm-gui.exe` (the desktop app, which also runs the download engine and local API), `dm-daemon.exe` (headless engine), `dm-native-host.exe`, and the browser extension in the `browser-extension` folder.
 
 ### Browser extension
 
-1. Extract `dm-extension.zip` to a folder.
-2. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
-3. Click **Load unpacked** and choose that folder.
-4. Keep `dm-gui.exe` running; the extension popup shows **App connected** when it can reach it.
+1. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
+2. Click **Load unpacked** and choose `%LOCALAPPDATA%\Programs\Download Manager Pro\browser-extension` (there is a Start menu shortcut to the folder).
+3. Keep Download Manager Pro running; the extension popup shows **App connected** when it can reach it.
 
 See [extension/README.md](extension/README.md) for details.
 
@@ -82,7 +74,7 @@ Binaries built from `core/`:
 To produce the release assets locally (Windows, PowerShell):
 
 ```powershell
-.\build_release.ps1   # output goes to .\release
+.\build_release.ps1   # builds the installer into .\release (needs Inno Setup: winget install JRSoftware.InnoSetup)
 ```
 
 The live YouTube test needs network access, `yt-dlp` and `ffmpeg`, so it is opt-in:
