@@ -90,9 +90,13 @@ tokio-util = "0.7"
 # Native GUI (Immediate Mode - egui)
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 open = "5.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

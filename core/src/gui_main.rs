@@ -1,3 +1,6 @@
+// Release builds are a GUI app: no console window behind it on Windows.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -38,11 +41,15 @@ fn main() -> eframe::Result<()> {
     });
 
     // 2. Configure native eframe / egui window
+    let mut viewport = eframe::egui::ViewportBuilder::default();
+    if let Some((width, height, rgba)) = gui_app::app_icon_rgba() {
+        viewport = viewport.with_icon(eframe::egui::IconData { rgba, width, height });
+    }
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
+        viewport: viewport
             .with_title("Download Manager Pro")
-            .with_inner_size(Vec2::new(1050.0, 680.0))
-            .with_min_inner_size(Vec2::new(800.0, 480.0))
+            .with_inner_size(Vec2::new(1100.0, 700.0))
+            .with_min_inner_size(Vec2::new(520.0, 420.0))
             .with_active(true)
             .with_drag_and_drop(true),
         ..Default::default()
