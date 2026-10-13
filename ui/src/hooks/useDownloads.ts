@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 
 export type DownloadStatus =
   | 'queued' | 'probing' | 'downloading' | 'paused'
@@ -458,7 +458,7 @@ export function useDownloads() {
     }
   }, [fetchRestSnapshot, flushPendingEvents])
 
-  async function addDownload(url: string, segments?: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) {
+  const addDownload = useCallback(async (url: string, segments?: number, saveDir?: string, quality?: string, filename?: string, totalBytesHint?: number) => {
     const resp = await fetch(`${DAEMON_URL}/downloads`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -469,9 +469,9 @@ export function useDownloads() {
       throw new Error(apiErrorMessage(err, 'Failed to add download'))
     }
     return await resp.json() as { id: string }
-  }
+  }, [])
 
-  async function cancelDownload(id: string, deleteFile = false) {
+  const cancelDownload = useCallback(async (id: string, deleteFile = false) => {
     let snapshot: DownloadJob | undefined
     setJobs(prev => {
       const next = new Map(prev)
@@ -495,9 +495,9 @@ export function useDownloads() {
       }
       throw e
     }
-  }
+  }, [])
 
-  async function pauseDownload(id: string) {
+  const pauseDownload = useCallback(async (id: string) => {
     let snapshot: DownloadJob | undefined
     setJobs(prev => {
       const next = new Map(prev)
@@ -519,9 +519,9 @@ export function useDownloads() {
       }
       throw e
     }
-  }
+  }, [])
 
-  async function resumeDownload(id: string) {
+  const resumeDownload = useCallback(async (id: string) => {
     let snapshot: DownloadJob | undefined
     setJobs(prev => {
       const next = new Map(prev)
@@ -544,24 +544,26 @@ export function useDownloads() {
       }
       throw e
     }
-  }
+  }, [])
 
-  async function stopAll(ids: string[]) {
+  const stopAll = useCallback(async (ids: string[]) => {
     await Promise.all(ids.map(id => pauseDownload(id).catch(() => undefined)))
-  }
+  }, [pauseDownload])
 
-  async function triggerUpdate() {
+  const triggerUpdate = useCallback(async () => {
     await fetch(`${DAEMON_URL}/update`, { method: 'POST' })
-  }
+  }, [])
 
-  async function getUpdateStatus(): Promise<{ state: string; version?: string; message?: string }> {
+  const getUpdateStatus = useCallback(async (): Promise<{ state: string; version?: string; message?: string }> => {
     const resp = await fetch(`${DAEMON_URL}/update/status`)
     if (!resp.ok) throw new Error('Failed to fetch update status')
     return await resp.json()
-  }
+  }, [])
+
+  const jobsList = useMemo(() => Array.from(jobs.values()), [jobs])
 
   return {
-    jobs: Array.from(jobs.values()),
+    jobs: jobsList,
     connected: connection === 'connected',
     connection,
     addDownload,

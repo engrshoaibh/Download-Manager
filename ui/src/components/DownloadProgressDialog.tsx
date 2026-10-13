@@ -33,7 +33,7 @@ function StandaloneProgress({ jobId, onClose }: { jobId?: string; onClose?: () =
   const searchParams = new URLSearchParams(window.location.search)
   const id = jobId || searchParams.get('id')
   const { jobs, pauseDownload, resumeDownload } = useDownloads()
-  const job = jobs.find(j => j.id === id)
+  const job = jobs.find((j: DownloadJob) => j.id === id)
 
   if (!job) {
     return (

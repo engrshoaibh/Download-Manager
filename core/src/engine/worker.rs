@@ -13,7 +13,7 @@ use crate::settings::BandwidthLimiter;
 
 use super::scheduler::{StealState, MIN_STEAL_BYTES};
 
-const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Max attempts per chunk (initial try + retries). Exhaustion isolates the
 /// failure — siblings keep running and unfinished bytes stay stealable.
 const MAX_RANGE_ATTEMPTS: u32 = 5;

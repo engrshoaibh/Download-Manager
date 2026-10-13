@@ -4,14 +4,14 @@ import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
 import { open } from '@tauri-apps/plugin-dialog'
 import packageJson from '../package.json'
-import { useDownloads } from './hooks/useDownloads'
+import { useDownloads, type DownloadJob } from './hooks/useDownloads'
 import { AddDownloadModal } from './components/AddDownloadModal'
 import { DownloadList } from './components/DownloadList'
 import { DeleteConfirmationModal } from './components/DeleteConfirmationModal'
 import { DownloadProgressDialog } from './components/DownloadProgressDialog'
 import { formatBytes, formatSpeed, matchesCategory, type CategoryId } from './lib/format'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { initDeepLinks, isWebsiteUrl } from './lib/deepLink'
+import { initDeepLinks } from './lib/deepLink'
 import './index.css'
 
 type MenuId = 'file' | 'downloads' | 'view' | 'help' | null
@@ -99,43 +99,27 @@ export default function App() {
   // dmpro:// links from the website
   useEffect(() => initDeepLinks(), [])
 
-  // A download sent by the website brings the window forward (it may be hidden in
-  // the tray). Jobs from the extension or added by hand behave as before.
-  const surfacedJobs = useRef<Set<string>>(new Set())
-  useEffect(() => {
-    for (const job of jobs) {
-      if (surfacedJobs.current.has(job.id)) continue
-      surfacedJobs.current.add(job.id)
-      const ageMs = Date.now() - new Date(job.created_at).getTime()
-      if (!isWebsiteUrl(job.url) || !(ageMs >= 0 && ageMs < 15_000)) continue
-      const win = getCurrentWindow()
-      win.show()
-        .then(() => win.unminimize())
-        .then(() => win.setFocus())
-        .catch(console.error)
-    }
-  }, [jobs])
 
   const activeJobs = useMemo(
-    () => jobs.filter(j => j.status === 'downloading' || j.status === 'probing'),
+    () => jobs.filter((j: DownloadJob) => j.status === 'downloading' || j.status === 'probing'),
     [jobs],
   )
   const completedJobs = useMemo(
-    () => jobs.filter(j => j.status === 'completed'),
+    () => jobs.filter((j: DownloadJob) => j.status === 'completed'),
     [jobs],
   )
   const totalSpeed = useMemo(
-    () => activeJobs.reduce((acc, j) => acc + j.speed_bps, 0),
+    () => activeJobs.reduce((acc: number, j: DownloadJob) => acc + j.speed_bps, 0),
     [activeJobs],
   )
 
   const filteredJobs = useMemo(() => {
-    let list = jobs.filter(j => matchesCategory(j.filename, j.status, category))
+    let list = jobs.filter((j: DownloadJob) => matchesCategory(j.filename, j.status, category))
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase()
-      list = list.filter(j => (j.filename || '').toLowerCase().includes(q) || (j.url || '').toLowerCase().includes(q))
+      list = list.filter((j: DownloadJob) => (j.filename || '').toLowerCase().includes(q) || (j.url || '').toLowerCase().includes(q))
     }
-    return list.sort((a, b) => {
+    return list.sort((a: DownloadJob, b: DownloadJob) => {
       const rank = (s: string) =>
         s === 'downloading' ? 0 : s === 'probing' ? 1 : s === 'queued' || s === 'paused' ? 2 : 3
       const d = rank(a.status) - rank(b.status)
@@ -147,17 +131,17 @@ export default function App() {
   const categoryCounts = useMemo(() => {
     const counts = {} as Record<CategoryId, number>
     for (const cat of CATEGORIES) {
-      counts[cat.id] = jobs.filter(j => matchesCategory(j.filename, j.status, cat.id)).length
+      counts[cat.id] = jobs.filter((j: DownloadJob) => matchesCategory(j.filename, j.status, cat.id)).length
     }
     return counts
   }, [jobs])
 
-  const selectedJobs = jobs.filter(j => selectedIds.has(j.id))
+  const selectedJobs = jobs.filter((j: DownloadJob) => selectedIds.has(j.id))
   const primaryJob = selectedJobs[0]
-  const selectedActive = selectedJobs.filter(j =>
+  const selectedActive = selectedJobs.filter((j: DownloadJob) =>
     j.status === 'downloading' || j.status === 'probing' || j.status === 'queued',
   )
-  const selectedPaused = selectedJobs.filter(j => j.status === 'paused' || j.status === 'failed')
+  const selectedPaused = selectedJobs.filter((j: DownloadJob) => j.status === 'paused' || j.status === 'failed')
 
   const canStop = selectedActive.length > 0
   const canResume = selectedPaused.length > 0
@@ -166,7 +150,7 @@ export default function App() {
 
   useEffect(() => {
     setSelectedIds(prev => {
-      const next = new Set([...prev].filter(id => jobs.some(j => j.id === id)))
+      const next = new Set([...prev].filter(id => jobs.some((j: DownloadJob) => j.id === id)))
       return next.size === prev.size ? prev : next
     })
   }, [jobs])
@@ -215,11 +199,11 @@ export default function App() {
   }
 
   function stopSelected() {
-    selectedActive.forEach(j => { void pauseDownload(j.id) })
+    selectedActive.forEach((j: DownloadJob) => { void pauseDownload(j.id) })
   }
 
   function resumeSelected() {
-    selectedPaused.forEach(j => { void resumeDownload(j.id) })
+    selectedPaused.forEach((j: DownloadJob) => { void resumeDownload(j.id) })
   }
 
   function requestDeleteSelected() {
@@ -229,15 +213,15 @@ export default function App() {
   }
 
   function confirmDelete(deleteFile: boolean) {
-    selectedJobs.forEach(j => cancelDownload(j.id, deleteFile))
+    selectedJobs.forEach((j: DownloadJob) => cancelDownload(j.id, deleteFile))
     setSelectedIds(new Set())
     setShowDeleteConfirm(false)
   }
 
   function handleStopAll() {
     const ids = jobs
-      .filter(j => j.status === 'downloading' || j.status === 'probing' || j.status === 'queued')
-      .map(j => j.id)
+      .filter((j: DownloadJob) => j.status === 'downloading' || j.status === 'probing' || j.status === 'queued')
+      .map((j: DownloadJob) => j.id)
     void stopAll(ids)
   }
 
@@ -299,22 +283,28 @@ export default function App() {
   }, [selectedIds, selectedJobs])
 
   useEffect(() => {
-    let timer: any
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+
     async function check() {
       try {
         const status = await getUpdateStatus()
+        if (cancelled) return
         setUpdateStatus(status)
-        if (status.state === 'checking' || status.state === 'downloading') {
-          timer = setTimeout(check, 2000)
-        } else {
+        const delay = status.state === 'checking' || status.state === 'downloading' ? 2000 : 60000
+        timer = setTimeout(check, delay)
+      } catch {
+        if (!cancelled) {
           timer = setTimeout(check, 60000)
         }
-      } catch {
-        timer = setTimeout(check, 60000)
       }
     }
+
     check()
-    return () => clearTimeout(timer)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
   }, [getUpdateStatus])
 
   function saveDefaultSegments(n: number) {
@@ -332,10 +322,17 @@ export default function App() {
       ? 'Add a URL from the toolbar, or press Ctrl+N.'
       : `Nothing matches “${CATEGORIES.find(c => c.id === category)?.label}”.`
 
+  const handleStartDragging = (e: ReactMouseEvent) => {
+    // Only drag on left click and when not clicking interactive elements like input or button
+    if (e.button === 0 && !(e.target as HTMLElement).closest('button, input, select, textarea, .window-btn')) {
+      getCurrentWindow().startDragging().catch(() => {})
+    }
+  }
+
   return (
     <div className="app">
-      <div data-tauri-drag-region className="titlebar">
-        <div className="titlebar-left">
+      <div data-tauri-drag-region className="titlebar" onMouseDown={handleStartDragging}>
+        <div className="titlebar-left" data-tauri-drag-region>
           <button className="titlebar-btn sidebar-toggle" onClick={() => setIsSidebarOpen(o => !o)} title="Toggle Sidebar">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
           </button>
@@ -531,7 +528,7 @@ export default function App() {
         <span>Speed: <strong className="mono">{formatSpeed(totalSpeed)}</strong></span>
         <span>Active: <strong>{activeJobs.length}</strong></span>
         <span>Complete: <strong>{completedJobs.length}</strong></span>
-        <span>Downloaded: <strong className="mono">{formatBytes(jobs.reduce((a, j) => a + j.downloaded_bytes, 0))}</strong></span>
+        <span>Downloaded: <strong className="mono">{formatBytes(jobs.reduce((a: number, j: DownloadJob) => a + j.downloaded_bytes, 0))}</strong></span>
         <span className="status-end">{filteredJobs.length} shown</span>
       </footer>
 
@@ -588,7 +585,7 @@ export default function App() {
                 />
                 <button type="button" className="icon-btn" onClick={async () => {
                   try {
-                    const selected = await open({
+                     const selected = await open({
                       directory: true,
                       multiple: false,
                     })
@@ -656,7 +653,7 @@ export default function App() {
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowProgressId(null)}>
           <div className="modal modal-progress" role="dialog" aria-modal="true">
             <DownloadProgressDialog
-              job={jobs.find(j => j.id === showProgressId)}
+              job={jobs.find((j: DownloadJob) => j.id === showProgressId)}
               jobId={showProgressId}
               onClose={() => setShowProgressId(null)}
               onPause={(id) => { void pauseDownload(id) }}

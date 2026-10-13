@@ -21,8 +21,8 @@ use crate::persist;
 use crate::settings::{BandwidthLimiter, DaemonSettings};
 
 /// Adaptive scaler starts here and grows while throughput keeps rising.
-/// Open most connections immediately. The scaler only adds the rest.
-const INITIAL_SEGMENT_COUNT: usize = 16;
+/// Start with 4 connections to avoid triggering strict server-side connection limits.
+const INITIAL_SEGMENT_COUNT: usize = 4;
 const DEFAULT_SEGMENT_COUNT: usize = 32;
 const MAX_SEGMENT_COUNT: usize = 32;
 const MIN_SEGMENT_BYTES: u64 = 256 * 1024;
@@ -364,6 +364,19 @@ impl DownloadManager {
                 .get(id)
                 .map(|s| s.active_runs.load(Ordering::Acquire) > 0)
                 .unwrap_or(false)
+    }
+
+    /// Mark a job as Failed and broadcast update
+    pub fn mark_failed(&mut self, id: &JobId, error_msg: String) {
+        if let Some(j) = self.jobs.get_mut(id) {
+            if j.status != DownloadStatus::Cancelled && j.status != DownloadStatus::Paused {
+                j.status = DownloadStatus::Failed;
+                j.speed_bps = 0.0;
+                j.error = Some(error_msg.chars().take(400).collect());
+                self.events.send(DmEvent::JobUpdated { job: j.clone() });
+                self.persist();
+            }
+        }
     }
 
     pub fn begin_resume(&mut self, id: &JobId) -> Result<DownloadJob> {
@@ -813,10 +826,15 @@ impl DownloadManager {
                                     })
                                     .collect();
                                 j.downloaded_bytes = downloaded;
-                                if j.speed_bps > 0.0 && j.total_bytes > downloaded {
-                                    j.eta_seconds = Some(
-                                        (j.total_bytes - downloaded) as f64 / j.speed_bps,
-                                    );
+                                if j.speed_bps > 10.0 && j.total_bytes > downloaded {
+                                    let eta = (j.total_bytes - downloaded) as f64 / j.speed_bps;
+                                    if eta.is_finite() && eta > 0.0 && eta < 86400.0 * 30.0 {
+                                        j.eta_seconds = Some(eta);
+                                    } else {
+                                        j.eta_seconds = None;
+                                    }
+                                } else {
+                                    j.eta_seconds = None;
                                 }
                                 Some(j.clone())
                             } else {
