@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "dm-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -1528,7 +1528,7 @@ impl eframe::App for NativeApp {
                     ui.set_width(400.0_f32);
                     ui.heading(RichText::new("⚡ Download Manager Pro").size(18.0).strong().color(c.accent));
                     ui.add_space(4.0_f32);
-                    ui.label(RichText::new("Version 0.1.14 (Native GPU Edition)").size(12.0).color(c.text_muted));
+                    ui.label(RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"), " (Native GPU Edition)")).size(12.0).color(c.text_muted));
                     ui.add_space(10.0_f32);
                     ui.label(RichText::new("A blazing-fast, lightweight IDM alternative built in native Rust.").color(c.text_main));
                     ui.add_space(4.0_f32);
