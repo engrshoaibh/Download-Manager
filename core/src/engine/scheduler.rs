@@ -206,7 +206,9 @@ mod tests {
             Segment::new(1, 0, 8 * 1024 * 1024),
         ];
         let mut state = StealState::from_segments(&segs);
-        let (id, start, end, _) = state.try_steal(MIN_STEAL_BYTES).unwrap();
+        state.set_active(0);
+        state.set_active(1);
+        let (id, start, end, _, _) = state.try_steal(MIN_STEAL_BYTES).unwrap();
         assert_eq!(id, 2);
         assert!(end > start);
         assert!(state.segments[1].end.load(Ordering::Relaxed) < 8 * 1024 * 1024);

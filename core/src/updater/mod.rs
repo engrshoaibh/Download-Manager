@@ -37,6 +37,17 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+/// Release asset matching the running executable (`dm-gui`, falling back to `dm-daemon`).
+fn own_asset_name() -> String {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let stem = env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    let base = if stem == "dm-gui" { "dm-gui" } else { "dm-daemon" };
+    format!("{base}{ext}")
+}
+
 pub fn get_status() -> UpdateStatus {
     UPDATE_STATUS.read().clone()
 }
@@ -71,7 +82,8 @@ pub async fn check_and_apply_update() -> Result<bool> {
         return Ok(false);
     }
 
-    let asset_name = if cfg!(windows) { "dm-daemon.exe" } else { "dm-daemon" };
+    // Update whichever binary is running (dm-gui or dm-daemon), never swap one for the other.
+    let asset_name = own_asset_name();
     let asset = release.assets.iter().find(|a| a.name == asset_name);
 
     let download_url = match asset {
@@ -146,7 +158,7 @@ pub fn spawn_auto_updater(interval: Duration) {
 pub fn cleanup_bak() {
     if let Ok(current_exe) = env::current_exe() {
         if let Some(dir) = current_exe.parent() {
-            let asset_name = if cfg!(windows) { "dm-daemon.exe" } else { "dm-daemon" };
+            let asset_name = own_asset_name();
             let bak = dir.join(format!("{}.bak", asset_name));
             if bak.exists() {
                 let _ = std::fs::remove_file(&bak);

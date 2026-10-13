@@ -542,7 +542,7 @@ pub fn find_ffmpeg_status() -> serde_json::Value {
     serde_json::to_value(&tools_health().ffmpeg).unwrap_or_default()
 }
 
-fn find_ffmpeg() -> Option<PathBuf> {
+pub fn find_ffmpeg() -> Option<PathBuf> {
     for name in ["ffmpeg.exe", "ffmpeg"] {
         if let Ok(p) = which(name) {
             return Some(p);
@@ -945,6 +945,8 @@ pub async fn probe_cancellable(
             if let Some(ref r) = opts.referer {
                 cmd.arg("--referer").arg(r);
             }
+        } else {
+            apply_account_auth(&mut cmd);
         }
 
         let mut child = cmd.spawn().context("run yt-dlp -J")?;
@@ -1014,7 +1016,38 @@ pub async fn probe_cancellable(
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     }
 
-    bail!("yt-dlp probe failed: {last_err}");
+    bail!("yt-dlp probe failed: {}", explain_ytdlp_error(&last_err));
+}
+
+/// Account cookies from Options (cookies.txt or a browser profile), used when the job itself
+/// carries none. YouTube increasingly answers anonymous yt-dlp requests with a bot check.
+fn apply_account_auth(cmd: &mut Command) {
+    let settings = crate::settings::load_settings();
+    if let Some(file) = settings.youtube_cookies_file.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+        if Path::new(file).is_file() {
+            cmd.arg("--cookies").arg(file);
+            return;
+        }
+        warn!("Configured YouTube cookies file not found: {file}");
+    }
+    if let Some(browser) = settings.youtube_cookies_browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        cmd.arg("--cookies-from-browser").arg(browser);
+    }
+}
+
+/// Turn yt-dlp's raw stderr into something the user can act on.
+fn explain_ytdlp_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+    if lower.contains("not a bot") || lower.contains("sign in to confirm") {
+        return format!(
+            "YouTube is asking to confirm you are not a bot. Open Options and set a YouTube cookies.txt file (or a browser such as Firefox), or send the video from the browser extension so your session cookies are used. Details: {}",
+            truncate_for_log(raw, 200)
+        );
+    }
+    if lower.contains("429") || lower.contains("too many requests") {
+        return format!("YouTube is rate limiting this connection (HTTP 429). Wait a few minutes and retry. Details: {}", truncate_for_log(raw, 200));
+    }
+    raw.to_string()
 }
 
 fn parse_info(json: serde_json::Value, fallback_url: &str) -> Result<YoutubeInfo> {
@@ -1279,6 +1312,7 @@ async fn assert_selected_height(
         }
     }
     // Prefer cookie-less preflight — matches the download path.
+    apply_account_auth(&mut cmd);
 
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
@@ -1288,7 +1322,7 @@ async fn assert_selected_height(
         bail!(
             "yt-dlp could not resolve a {}p format: {}",
             want_height,
-            truncate_for_log(err.trim(), 400)
+            explain_ytdlp_error(&truncate_for_log(err.trim(), 400))
         );
     }
 
@@ -1577,6 +1611,8 @@ async fn download_once(
     }
     if let Some(ref path) = cookie_path {
         cmd.arg("--cookies").arg(path);
+    } else {
+        apply_account_auth(&mut cmd);
     }
     if let Some(ref r) = opts.referer {
         cmd.arg("--referer").arg(r);

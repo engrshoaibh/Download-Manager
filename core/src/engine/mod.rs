@@ -7,6 +7,7 @@ pub mod scheduler;
 pub mod segment;
 pub mod worker;
 pub mod chunked;
+pub mod integrity;
 pub mod native_payload;
 
 /// Unique identifier for a download job

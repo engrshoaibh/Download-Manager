@@ -28,6 +28,12 @@ pub struct DaemonSettings {
     /// Active and paused jobs are never pruned by this cap.
     #[serde(default = "default_job_history_limit")]
     pub job_history_limit: usize,
+    /// Netscape `cookies.txt` handed to yt-dlp when YouTube asks to "confirm you're not a bot".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube_cookies_file: Option<String>,
+    /// Browser yt-dlp should read cookies from (`firefox`, `chrome`, `edge`, `brave`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube_cookies_browser: Option<String>,
 }
 
 fn default_max_global_connections() -> usize {
@@ -49,14 +55,21 @@ impl Default for DaemonSettings {
             max_global_connections: default_max_global_connections(),
             orphan_part_retention_hours: default_orphan_part_retention_hours(),
             job_history_limit: default_job_history_limit(),
+            youtube_cookies_file: None,
+            youtube_cookies_browser: None,
         }
     }
 }
 
 pub fn settings_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR)
+    // DM_DATA_DIR lets tests and portable installs keep state out of the user profile.
+    std::env::var_os("DM_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(APP_DIR)
+        })
         .join(SETTINGS_FILE)
 }
 

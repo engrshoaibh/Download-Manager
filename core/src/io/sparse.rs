@@ -149,13 +149,17 @@ pub fn write_part_meta_atomic(meta: &PartMetadata) -> Result<()> {
         .with_context(|| format!("Failed to create directory {}", parent.display()))?;
 
     // Same-directory temp so rename is atomic on the same volume.
+    // The suffix must be unique per call: checkpoint ticks, pause and worker exit can all
+    // write meta at once, and a shared temp name made one writer rename the other's file away.
+    static META_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_name = format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         final_path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("part.meta"),
-        std::process::id()
+        std::process::id(),
+        META_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let tmp_path = parent.join(tmp_name);
 
@@ -174,7 +178,17 @@ pub fn write_part_meta_atomic(meta: &PartMetadata) -> Result<()> {
             .with_context(|| format!("Failed to sync {}", tmp_path.display()))?;
     }
 
-    fs::rename(&tmp_path, &final_path).with_context(|| {
+    // Windows can briefly refuse to replace a file another writer just renamed; retry.
+    let mut renamed = fs::rename(&tmp_path, &final_path);
+    for _ in 0..4 {
+        if renamed.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        renamed = fs::rename(&tmp_path, &final_path);
+    }
+    renamed.with_context(|| {
+        let _ = fs::remove_file(&tmp_path);
         format!(
             "Failed to atomically replace {} with {}",
             final_path.display(),

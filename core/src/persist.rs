@@ -29,9 +29,14 @@ pub struct JobsFile {
 
 /// `%LOCALAPPDATA%/download-manager/jobs.json` (or platform equivalent).
 pub fn state_path() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR)
+    // DM_DATA_DIR lets tests and portable installs keep state out of the user profile.
+    std::env::var_os("DM_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(APP_DIR)
+        })
         .join(STATE_FILE)
 }
 
@@ -332,6 +337,7 @@ mod tests {
     fn sample_job(status: DownloadStatus, age_secs: i64) -> DownloadJob {
         let created = Utc::now() - chrono::Duration::seconds(age_secs);
         DownloadJob {
+            phase: None,
             id: Uuid::new_v4(),
             url: "https://example.com/f".into(),
             filename: "f.bin".into(),

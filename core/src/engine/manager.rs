@@ -433,10 +433,25 @@ impl DownloadManager {
             job.referer = referer.clone();
         }
 
-        let resuming = !job.segments.is_empty()
-            && job.total_bytes > 0
-            && (job.segments.iter().any(|s| s.downloaded > 0)
-                || crate::io::sparse::resolve_partial_path(&job.save_path).is_some());
+        // Resume only when the saved segment state and the `.part` payload agree.
+        // If either half is missing/corrupt, resuming would yield a zero-filled file.
+        let mut restarted = false;
+        let resuming = if job.segments.is_empty() {
+            false
+        } else {
+            let partial = crate::io::sparse::resolve_partial_path(&job.save_path)
+                .unwrap_or_else(|| part_data_path(&job.save_path));
+            match crate::engine::integrity::check_resume(&job.segments, job.total_bytes, &partial) {
+                crate::engine::integrity::ResumeCheck::Resume => true,
+                crate::engine::integrity::ResumeCheck::Restart(reason) => {
+                    warn!("Cannot resume {}: {reason} - restarting from the beginning", job.filename);
+                    job.segments.clear();
+                    job.downloaded_bytes = 0;
+                    restarted = true;
+                    false
+                }
+            }
+        };
 
         let update_state = |mgr: Arc<RwLock<Self>>, updated_job: DownloadJob| async move {
             let mut m = mgr.write().await;
@@ -474,7 +489,9 @@ impl DownloadManager {
         if !resuming {
             if job.total_bytes > 0 {
                 job.status = DownloadStatus::Downloading;
-                job.supports_ranges = true; // Assume true if size is provided
+                if !restarted {
+                    job.supports_ranges = true; // Assume true if size is provided
+                }
                 update_state(mgr.clone(), job.clone()).await;
             } else {
                 job.status = DownloadStatus::Probing;
@@ -1052,43 +1069,30 @@ impl DownloadManager {
         drop(mmap);
 
         if job.total_bytes > 0 {
-            if downloaded != job.total_bytes {
+            let verified = crate::engine::integrity::verify_complete(&job.segments, job.total_bytes);
+            if let Err(e) = verified {
                 job.status = DownloadStatus::Failed;
                 job.speed_bps = 0.0;
                 update_state(mgr.clone(), job.clone()).await;
-                bail!(
-                    "Download incomplete: wrote {} bytes, expected Content-Length {}",
-                    downloaded,
-                    job.total_bytes
-                );
-            }
-            // Sequential (non-mmap) path: file length is actual payload size.
-            if !std::path::Path::new(&tmp_path).exists() {
-                job.status = DownloadStatus::Failed;
-                update_state(mgr.clone(), job.clone()).await;
-                bail!("Temp file missing after download: {tmp_path}");
-            }
-            let file_len = std::fs::metadata(&tmp_path)
-                .with_context(|| format!("Failed to stat {tmp_path}"))?
-                .len();
-            // Sparse files are pre-sized to total_bytes; sequential appends grow.
-            // Accept either exact match or sparse preallocation equality.
-            if file_len != job.total_bytes {
-                job.status = DownloadStatus::Failed;
-                job.speed_bps = 0.0;
-                update_state(mgr.clone(), job.clone()).await;
-                bail!(
-                    "File size mismatch: temp file is {} bytes, expected Content-Length {}",
-                    file_len,
-                    job.total_bytes
-                );
+                bail!("Download incomplete ({downloaded} of {} bytes): {e:#}", job.total_bytes);
             }
         }
 
-        if let Err(e) = std::fs::rename(&tmp_path, &job.save_path) {
-            tracing::warn!("Failed to rename {} to {}: {}", tmp_path, job.save_path, e);
+        let expected_len = (job.total_bytes > 0).then_some(job.total_bytes);
+        if let Err(e) = crate::engine::integrity::finalize_file(
+            std::path::Path::new(&tmp_path),
+            std::path::Path::new(&job.save_path),
+            expected_len,
+        )
+        .await
+        {
+            // Keep the .part payload + meta so Resume can finish the move.
+            job.status = DownloadStatus::Failed;
+            job.speed_bps = 0.0;
+            update_state(mgr.clone(), job.clone()).await;
+            return Err(e.context("Could not finalize downloaded file"));
         }
-        // Payload renamed; drop resume sidecar.
+        // Payload is in place; drop resume sidecar.
         let _ = std::fs::remove_file(crate::io::sparse::part_meta_path(&job.save_path));
 
         job.status = DownloadStatus::Completed;
