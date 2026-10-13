@@ -8,72 +8,73 @@
 </head>
 <body>
   <header>
-    <img src="../icons/icon48.png" width="32" height="32" alt="" />
-    <div>
+    <img src="../icons/icon48.png" width="36" height="36" alt="" />
+    <div class="title">
       <h1>Download Manager Pro</h1>
-      <p id="daemon" class="daemon">Checking daemon…</p>
+      <p id="daemon" class="daemon"><span class="dot"></span><span id="daemonText">Checking app…</span></p>
     </div>
+    <label class="master" title="Capture downloads">
+      <input type="checkbox" id="enabled" class="switch" />
+    </label>
   </header>
 
-  <section>
-    <label class="switch-row">
-      <span>Capture downloads</span>
-      <input type="checkbox" id="enabled" />
-    </label>
+  <main>
+    <section class="card">
+      <h2>Capture</h2>
+      <label class="field">
+        <span>Mode</span>
+        <select id="captureMode">
+          <option value="ask">Ask first (dialog)</option>
+          <option value="auto">Send automatically</option>
+          <option value="off">Off — browser only</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>Intercept browser downloads</span>
+        <input type="checkbox" id="interceptBrowserDownloads" class="switch" />
+      </label>
+      <label class="row">
+        <span>Open dialog on link click</span>
+        <input type="checkbox" id="linkClickCapture" class="switch" />
+      </label>
+      <label class="row">
+        <span>Alt+click forces capture</span>
+        <input type="checkbox" id="altClickCapture" class="switch" />
+      </label>
+    </section>
 
-    <label class="field">
-      <span>Capture mode</span>
-      <select id="captureMode">
-        <option value="ask">Ask (IDM-style dialog)</option>
-        <option value="auto">Auto — send to DM</option>
-        <option value="off">Off — browser only</option>
-      </select>
-    </label>
+    <section class="card">
+      <h2>Video</h2>
+      <label class="row">
+        <span>Catch video page links</span>
+        <input type="checkbox" id="catchVideoPageLinks" class="switch" />
+      </label>
+      <label class="row">
+        <span>Download banner on videos</span>
+        <input type="checkbox" id="videoBanner" class="switch" />
+      </label>
+      <label class="row">
+        <span>Media grabber panel</span>
+        <input type="checkbox" id="mediaGrabber" class="switch" />
+      </label>
+    </section>
 
-    <label class="switch-row">
-      <span>Intercept browser downloads</span>
-      <input type="checkbox" id="interceptBrowserDownloads" />
-    </label>
-
-    <label class="switch-row">
-      <span>Open dialog on link click</span>
-      <input type="checkbox" id="linkClickCapture" />
-    </label>
-
-    <label class="switch-row">
-      <span>Catch video page links (not YouTube suggestions)</span>
-      <input type="checkbox" id="catchVideoPageLinks" />
-    </label>
-
-    <label class="switch-row">
-      <span>Video download banner</span>
-      <input type="checkbox" id="videoBanner" />
-    </label>
-
-    <label class="switch-row">
-      <span>Media grabber panel</span>
-      <input type="checkbox" id="mediaGrabber" />
-    </label>
-
-    <label class="switch-row">
-      <span>Alt+click forces capture</span>
-      <input type="checkbox" id="altClickCapture" />
-    </label>
-
-    <label class="field">
-      <span>Default segments</span>
-      <input type="number" id="segments" min="1" max="64" />
-    </label>
-
-    <label class="field">
-      <span>File types (comma-separated)</span>
-      <textarea id="extensions" rows="4" spellcheck="false"></textarea>
-    </label>
-  </section>
+    <section class="card">
+      <h2>Downloads</h2>
+      <label class="field">
+        <span>Connections per download</span>
+        <input type="number" id="segments" min="1" max="64" />
+      </label>
+      <label class="field">
+        <span>File types to capture</span>
+        <textarea id="extensions" rows="3" spellcheck="false"></textarea>
+      </label>
+    </section>
+  </main>
 
   <footer>
-    <button type="button" id="save" class="primary">Save</button>
     <span id="saved" class="saved" hidden>Saved</span>
+    <button type="button" id="save" class="primary">Save changes</button>
   </footer>
 
   <script type="module" src="popup.js"></script>

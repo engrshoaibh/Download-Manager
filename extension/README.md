@@ -17,8 +17,8 @@ IDM-style **Internet Download Module** for this project: sniffs downloadable URL
 
 ## Prerequisites
 
-1. **Daemon running** — start `dm-daemon` (listens on `127.0.0.1:7373`).
-2. Optional: open the Tauri UI to watch progress.
+1. **App running** — start `dm-gui.exe` (or the headless `dm-daemon`); it listens on `127.0.0.1:7373`.
+2. The desktop app shows progress for everything the extension sends.
 
 ## Install (Chrome / Edge / Brave)
 
@@ -26,7 +26,7 @@ IDM-style **Internet Download Module** for this project: sniffs downloadable URL
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
 4. Select this folder: `extension/`.
-5. Pin the toolbar icon and confirm the popup shows **Daemon online**.
+5. Pin the toolbar icon and confirm the popup shows **App connected**.
 
 ## Usage
 

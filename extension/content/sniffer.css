@@ -171,7 +171,7 @@
   margin-left: 6px;
   font-size: 9px;
   font-weight: 800;
-  color: #e87722;
+  color: #706ef6;
   letter-spacing: 0.04em;
   vertical-align: middle;
 }
@@ -226,7 +226,7 @@
 
 #dm-media-grabber .dm-mg-title {
   font-weight: 600;
-  color: #e87722;
+  color: #706ef6;
   letter-spacing: 0.02em;
 }
 
@@ -282,8 +282,8 @@
   flex-shrink: 0;
   border: 0;
   border-radius: 4px;
-  background: #e87722;
-  color: #16181d;
+  background: #706ef6;
+  color: #fff;
   font-weight: 600;
   font-size: 11px;
   padding: 4px 8px;
@@ -291,7 +291,7 @@
 }
 
 #dm-media-grabber .dm-mg-dl:hover {
-  background: #f08938;
+  background: #8684fa;
 }
 
 #dm-toast {

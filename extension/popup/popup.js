@@ -12,6 +12,7 @@ const els = {
   segments: document.getElementById('segments'),
   extensions: document.getElementById('extensions'),
   daemon: document.getElementById('daemon'),
+  daemonText: document.getElementById('daemonText'),
   save: document.getElementById('save'),
   saved: document.getElementById('saved'),
 };
@@ -19,10 +20,10 @@ const els = {
 async function refreshDaemon() {
   const res = await chrome.runtime.sendMessage({ type: 'CHECK_DAEMON' });
   if (res?.ok) {
-    els.daemon.textContent = `Daemon online · v${res.version || '?'}`;
+    els.daemonText.textContent = `App connected · v${res.version || '?'}`;
     els.daemon.className = 'daemon ok';
   } else {
-    els.daemon.textContent = res?.error || 'Daemon offline (127.0.0.1:7373)';
+    els.daemonText.textContent = res?.error || 'App not running — start Download Manager Pro';
     els.daemon.className = 'daemon bad';
   }
 }
