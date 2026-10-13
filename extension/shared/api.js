@@ -179,6 +179,41 @@ export async function cookiesForUrl(url, pageUrl = '') {
 }
 
 /**
+ * Export the browser's YouTube/Google session as a Netscape cookie file.
+ * Unlike a flat Cookie header this keeps each cookie's real domain, path, expiry and
+ * flags, which is what yt-dlp needs to pass YouTube's "confirm you're not a bot" check.
+ * It only ever goes to the local app on 127.0.0.1.
+ */
+export async function youtubeCookieJar() {
+  try {
+    const seen = new Map();
+    for (const domain of ['youtube.com', 'google.com']) {
+      const list = await chrome.cookies.getAll({ domain });
+      for (const c of list || []) {
+        seen.set(`${c.domain}|${c.path}|${c.name}`, c);
+      }
+    }
+    if (!seen.size) return '';
+    const lines = ['# Netscape HTTP Cookie File'];
+    for (const c of seen.values()) {
+      const expiry = c.session || !c.expirationDate ? 0 : Math.floor(c.expirationDate);
+      lines.push([
+        `${c.httpOnly ? '#HttpOnly_' : ''}${c.domain}`,
+        c.domain.startsWith('.') ? 'TRUE' : 'FALSE',
+        c.path || '/',
+        c.secure ? 'TRUE' : 'FALSE',
+        expiry,
+        c.name,
+        c.value,
+      ].join('\t'));
+    }
+    return lines.join('\n');
+  } catch {
+    return '';
+  }
+}
+
+/**
  * POST a new download to the local daemon.
  */
 export async function addDownload({
@@ -299,10 +334,17 @@ export async function captureToDaemon(url, settings = {}) {
     filename = suggestFilename(downloadUrl, label);
   }
 
+  /* yt-dlp jobs get the real browser cookie jar; direct CDN downloads keep the Cookie header. */
+  let cookiesToSend = cookies;
+  if (!isCdn && /youtube\.com|youtu\.be/i.test(`${downloadUrl} ${pageUrl}`)) {
+    const jar = await youtubeCookieJar();
+    if (jar) cookiesToSend = jar;
+  }
+
   return addDownload({
     url: downloadUrl,
     userAgent,
-    cookies: cookies || undefined,
+    cookies: cookiesToSend || undefined,
     referer,
     segments: settings.segments || 16,
     saveDir: settings.saveDir || undefined,

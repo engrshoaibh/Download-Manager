@@ -22,7 +22,7 @@ async fn youtube_video_downloads_to_a_playable_file() {
         .write()
         .await
         .add_download(
-            "https://www.youtube.com/watch?v=jNQXAC9IVRw".into(),
+            std::env::var("DM_TEST_YT_URL").unwrap_or_else(|_| "https://www.youtube.com/watch?v=jNQXAC9IVRw".into()),
             dir.join("out").to_string_lossy().into(),
             None, None, None, None, None, None, None,
             Some("best".into()),
