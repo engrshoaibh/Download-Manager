@@ -34,6 +34,7 @@ pub async fn serve(manager: SharedManager) -> Result<()> {
         .route("/dialog/folder", get(routes::select_folder))
         .route("/update", post(routes::trigger_update))
         .route("/update/status", get(routes::get_update_status))
+        .route("/window/show", post(routes::show_window))
         .route("/ws", get(routes::ws_handler))
         .layer(cors)
         .with_state(manager);

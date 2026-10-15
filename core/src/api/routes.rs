@@ -35,6 +35,10 @@ pub async fn health() -> impl IntoResponse {
     )
 }
 
+pub async fn show_window() -> impl IntoResponse {
+    Json(serde_json::json!({ "shown": crate::notify_show_window() }))
+}
+
 pub async fn get_settings(State(mgr): State<SharedManager>) -> impl IntoResponse {
     let mgr = mgr.read().await;
     Json(mgr.settings.clone())

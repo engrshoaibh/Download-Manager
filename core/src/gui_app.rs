@@ -232,6 +232,10 @@ pub struct NativeApp {
     // YouTube account cookies (Options)
     yt_cookies_file: String,
     yt_cookies_browser: String,
+
+    // Keeps the tray icon alive; while present, closing the window only hides it.
+    tray: Option<Box<dyn std::any::Any>>,
+    quitting: bool,
 }
 
 impl NativeApp {
@@ -276,7 +280,14 @@ impl NativeApp {
             logo: None,
             yt_cookies_file,
             yt_cookies_browser,
+            tray: None,
+            quitting: false,
         }
+    }
+
+    pub fn with_tray(mut self, tray: Option<Box<dyn std::any::Any>>) -> Self {
+        self.tray = tray;
+        self
     }
 
     fn refresh_jobs(&mut self) {
@@ -794,6 +805,12 @@ impl eframe::App for NativeApp {
         self.refresh_jobs();
         ctx.request_repaint_after(Duration::from_millis(250));
 
+        // Closing the window sends the app to the tray; downloads and the browser API keep running.
+        if self.tray.is_some() && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            crate::tray::hide_window();
+        }
+
         if self.logo.is_none() {
             if let Some((w, h, px)) = app_icon_rgba() {
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px);
@@ -904,6 +921,12 @@ impl eframe::App for NativeApp {
                                 self.show_settings_modal = true;
                                 ui.close_menu();
                             }
+                            ui.separator();
+                            if ui.button("Exit").on_hover_text("Quit and stop all downloads").clicked() {
+                                self.quitting = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                ui.close_menu();
+                            }
                         });
                         ui.menu_button("View", |ui| {
                             if ui.button("Toggle sidebar").clicked() {
@@ -928,6 +951,7 @@ impl eframe::App for NativeApp {
                                 .clicked()
                                 && dm_core::updater::launch_staged_installer().is_ok()
                             {
+                                self.quitting = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             ui.add_space(6.0);

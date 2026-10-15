@@ -40,7 +40,7 @@ It installs `dm-gui.exe` (the desktop app, which also runs the download engine a
 
 1. Open `chrome://extensions` (or `edge://extensions`) and enable **Developer mode**.
 2. Click **Load unpacked** and choose `%LOCALAPPDATA%\Programs\Download Manager Pro\browser-extension` (there is a Start menu shortcut to the folder).
-3. Keep Download Manager Pro running; the extension popup shows **App connected** when it can reach it.
+3. Keep Download Manager Pro running; the extension popup shows **App connected** when it can reach it. Closing the window sends the app to the system tray, so downloads and the extension keep working; use **Quit** in the tray menu (or **File → Exit**) to stop it.
 
 See [extension/README.md](extension/README.md) for details.
 

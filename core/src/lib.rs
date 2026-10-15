@@ -24,6 +24,19 @@ pub(crate) fn notify_job_added(url: &str) {
     }
 }
 
+type ShowWindowHook = Box<dyn Fn() + Send + Sync>;
+static SHOW_WINDOW_HOOK: std::sync::OnceLock<ShowWindowHook> = std::sync::OnceLock::new();
+
+/// The desktop app registers this so a second launch can bring the running window back
+/// from the tray. Returns false when no window is attached (headless daemon).
+pub fn set_show_window_hook(hook: impl Fn() + Send + Sync + 'static) {
+    let _ = SHOW_WINDOW_HOOK.set(Box::new(hook));
+}
+
+pub(crate) fn notify_show_window() -> bool {
+    SHOW_WINDOW_HOOK.get().map(|hook| hook()).is_some()
+}
+
 use anyhow::Result;
 use tracing::{info, warn};
 
