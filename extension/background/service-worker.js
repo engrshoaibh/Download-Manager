@@ -362,7 +362,7 @@ chrome.runtime.onInstalled.addListener(async () => {
       type: 'basic',
       iconUrl: ICON(),
       title: 'Download Manager',
-      message: 'Daemon not detected on port 7373. Start dm-daemon to capture downloads.',
+      message: 'Download Manager Pro is not running. Open it to capture downloads.',
     });
   }
 });

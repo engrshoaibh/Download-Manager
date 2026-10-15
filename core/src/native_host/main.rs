@@ -110,14 +110,16 @@ async fn run_task(engine: std::sync::Arc<dm_core::engine::chunked::ChunkedEngine
 
     info!("Multiplexing {}", payload.task_id);
     let ffmpeg = dm_core::youtube::find_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let output = tokio::process::Command::new(&ffmpeg)
-        .arg("-y")
+    let mut cmd = tokio::process::Command::new(&ffmpeg);
+    cmd.arg("-y")
         .arg("-i").arg(&video_tmp)
         .arg("-i").arg(&audio_tmp)
         .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"])
-        .arg(&mux_tmp)
-        .output()
-        .await;
+        .arg(&mux_tmp);
+    // CREATE_NO_WINDOW: never flash a console window while muxing.
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let output = cmd.output().await;
 
     match output {
         Ok(o) if o.status.success() && mux_tmp.exists() => {

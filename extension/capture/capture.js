@@ -60,7 +60,7 @@ elName.value =
 
   const health = await chrome.runtime.sendMessage({ type: 'CHECK_DAEMON' });
   if (!health?.ok) {
-    setStatus(health?.error || 'Daemon offline — start dm-daemon on port 7373', 'error');
+    setStatus(health?.error || 'App offline — open Download Manager Pro', 'error');
   } else if (isCdn) {
     const sizeHint = finalSize > 0 ? ` · ${(finalSize / (1024 * 1024)).toFixed(0)} MB` : '';
     setStatus(`Direct stream · segmented download${sizeHint}`, 'ok');

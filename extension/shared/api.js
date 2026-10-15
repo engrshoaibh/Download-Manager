@@ -268,7 +268,7 @@ export async function captureToDaemon(url, settings = {}) {
   const health = await checkDaemon();
   if (!health.ok) {
     throw new Error(
-      'Download Manager daemon is not running on 127.0.0.1:7373. Start dm-daemon first.'
+      'Download Manager Pro is not running. Open the app first.'
     );
   }
 
