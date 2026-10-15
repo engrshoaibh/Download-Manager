@@ -236,6 +236,8 @@ pub struct NativeApp {
     // Keeps the tray icon alive; while present, closing the window only hides it.
     tray: Option<Box<dyn std::any::Any>>,
     quitting: bool,
+    /// `--background`: hide the window right after eframe first shows it.
+    hide_on_start: bool,
 }
 
 impl NativeApp {
@@ -282,11 +284,21 @@ impl NativeApp {
             yt_cookies_browser,
             tray: None,
             quitting: false,
+            hide_on_start: false,
         }
     }
 
     pub fn with_tray(mut self, tray: Option<Box<dyn std::any::Any>>) -> Self {
         self.tray = tray;
+        self
+    }
+
+    /// Start hidden in the tray. Without a tray the window stays visible so the app is reachable.
+    pub fn start_hidden(mut self, hidden: bool) -> Self {
+        self.hide_on_start = hidden && self.tray.is_some();
+        if self.hide_on_start {
+            crate::tray::begin_hidden_start();
+        }
         self
     }
 
@@ -806,6 +818,17 @@ impl eframe::App for NativeApp {
         ctx.request_repaint_after(Duration::from_millis(250));
 
         // Closing the window sends the app to the tray; downloads and the browser API keep running.
+        // eframe makes the window visible after the first frame; hide it on the next one.
+        if self.hide_on_start {
+            if self.style_applied {
+                // Not the first frame any more: eframe has already shown the window.
+                self.hide_on_start = false;
+                crate::tray::finish_hidden_start();
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
         if self.tray.is_some() && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             crate::tray::hide_window();

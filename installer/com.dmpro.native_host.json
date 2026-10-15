@@ -1,0 +1,7 @@
+{
+  "name": "com.dmpro.native_host",
+  "description": "Download Manager Pro native messaging host",
+  "path": "dm-native-host.exe",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://ekgkljpblmhpfjfnkmedhhjegphncedk/"]
+}

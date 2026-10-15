@@ -1,4 +1,4 @@
-import { DAEMON_URL } from './config.js';
+import { DAEMON_URL, NATIVE_HOST } from './config.js';
 import { suggestFilename, resolveCaptureTarget } from './media.js';
 
 export async function checkDaemon() {
@@ -10,6 +10,28 @@ export async function checkDaemon() {
   } catch (e) {
     return { ok: false, error: e.message || 'Daemon unreachable' };
   }
+}
+
+/**
+ * Like checkDaemon, but when the app is closed ask the native host to start it
+ * (hidden in the tray) and wait for it, the way IDM's extension wakes IDM.
+ */
+export async function ensureDaemon() {
+  const health = await checkDaemon();
+  if (health.ok) return health;
+  try {
+    const reply = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { type: 'launch' });
+    if (reply?.status === 'ERROR') return { ok: false, error: reply.message || 'App failed to start' };
+  } catch (e) {
+    /* Host not registered (unpacked dev install) — report the original failure. */
+    return health;
+  }
+  for (let i = 0; i < 10; i++) {
+    const again = await checkDaemon();
+    if (again.ok) return again;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return { ok: false, error: 'App started but is not answering yet' };
 }
 
 /** Probe YouTube formats/sizes via the local daemon (yt-dlp). */
@@ -265,10 +287,10 @@ export async function addDownload({
  * (same as online YT downloaders). Watch-page URLs still use yt-dlp.
  */
 export async function captureToDaemon(url, settings = {}) {
-  const health = await checkDaemon();
+  const health = await ensureDaemon();
   if (!health.ok) {
     throw new Error(
-      'Download Manager Pro is not running. Open the app first.'
+      'Download Manager Pro is not running and could not be started. Open the app first.'
     );
   }
 

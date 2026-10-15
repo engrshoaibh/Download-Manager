@@ -2,6 +2,9 @@
 
 export const DAEMON_URL = 'http://127.0.0.1:7373';
 
+/** Native messaging host registered by the installer; it starts the app when it is closed. */
+export const NATIVE_HOST = 'com.dmpro.native_host';
+
 /** File extensions IDM typically captures by default. */
 export const DEFAULT_EXTENSIONS = [
   'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso',

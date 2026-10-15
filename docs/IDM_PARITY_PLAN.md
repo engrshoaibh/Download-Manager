@@ -48,7 +48,8 @@ extension IDs) is reused. We copy the architecture, not the implementation.
 
 Done when a fresh install can download a 1080p YouTube video with nothing preinstalled.
 
-### Phase 1: Background start and native messaging (small)
+### Phase 1: Background start and native messaging (small) — implemented 2026-10-16
+Host name `com.dmpro.native_host`; the extension ID is pinned to `ekgkljpblmhpfjfnkmedhhjegphncedk` by the `key` in `extension/manifest.json`. Firefox is not registered yet, because the extension doesn't run there.
 - `dm-gui --background`: start hidden in the tray. The installer's start-with-Windows Run entry passes it.
 - Installer registers `dm-native-host.exe` as a native messaging host (HKCU, Chrome + Edge + Firefox) with a JSON manifest that names our extension's ID.
 - The native host's only new job: if the app isn't running, start `dm-gui --background`, then wait for `/health`.

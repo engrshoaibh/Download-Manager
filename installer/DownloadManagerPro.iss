@@ -55,6 +55,8 @@ Name: "startup"; Description: "Start {#AppName} when I sign in to Windows"; Grou
 Source: "{#SourceDir}\core\target\release\dm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\core\target\release\dm-daemon.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\core\target\release\dm-native-host.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Native messaging manifest: lets the browser extension start the app when it is closed.
+Source: "{#SourceDir}\installer\com.dmpro.native_host.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\extension\*"; DestDir: "{app}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -64,7 +66,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Name: "{autoprograms}\{#AppName} browser extension folder"; Filename: "{app}\browser-extension"
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DownloadManagerPro"; ValueData: """{app}\{#AppExe}"""; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DownloadManagerPro"; ValueData: """{app}\{#AppExe}"" --background"; Flags: uninsdeletevalue; Tasks: startup
+; Register the native messaging host for Chromium browsers (per user, no admin needed).
+Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.dmpro.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\com.dmpro.native_host.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.dmpro.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\com.dmpro.native_host.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.dmpro.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\com.dmpro.native_host.json"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Chromium\NativeMessagingHosts\com.dmpro.native_host"; ValueType: string; ValueName: ""; ValueData: "{app}\com.dmpro.native_host.json"; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent

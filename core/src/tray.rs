@@ -37,6 +37,40 @@ pub fn show_window() {
     }
 }
 
+/// eframe always shows the window after its first frame, so a hidden start makes the window
+/// fully transparent until `finish_hidden_start` hides it; nothing flashes on screen.
+#[cfg(windows)]
+pub fn begin_hidden_start() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+    };
+    let hwnd = HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+        SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    }
+}
+
+#[cfg(windows)]
+pub fn finish_hidden_start() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED};
+    hide_window();
+    let hwnd = HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED as isize));
+    }
+}
+
 #[cfg(windows)]
 pub fn hide_window() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
@@ -95,6 +129,12 @@ pub fn show_window() {}
 
 #[cfg(not(windows))]
 pub fn hide_window() {}
+
+#[cfg(not(windows))]
+pub fn begin_hidden_start() {}
+
+#[cfg(not(windows))]
+pub fn finish_hidden_start() {}
 
 #[cfg(not(windows))]
 pub fn install(_icon: Option<(u32, u32, Vec<u8>)>) -> Option<()> {

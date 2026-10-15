@@ -11,9 +11,9 @@ mod gui_app;
 mod tray;
 use gui_app::NativeApp;
 
-/// If the app is already running (likely hidden in the tray), ask it to show its window.
-/// Returns true when that instance took over, so this launch should just exit.
-fn activate_running_instance() -> bool {
+/// If the app is already running (likely hidden in the tray), ask it to show its window
+/// (unless `show` is false). Returns true when that instance took over, so this launch should exit.
+fn activate_running_instance(show: bool) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -22,6 +22,9 @@ fn activate_running_instance() -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
         return false;
     };
+    if !show {
+        return true;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let req = "POST /window/show HTTP/1.1\r\nHost: 127.0.0.1:7373\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     if stream.write_all(req.as_bytes()).is_err() {
@@ -33,7 +36,9 @@ fn activate_running_instance() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
-    if activate_running_instance() {
+    // `--background`: start hidden in the tray (sign-in autostart, or woken by the browser).
+    let background = cfg!(windows) && std::env::args().any(|a| a == "--background");
+    if activate_running_instance(!background) {
         return Ok(());
     }
 
@@ -82,7 +87,7 @@ fn main() -> eframe::Result<()> {
             .with_title("Download Manager Pro")
             .with_inner_size(Vec2::new(1100.0, 700.0))
             .with_min_inner_size(Vec2::new(520.0, 420.0))
-            .with_active(true)
+            .with_active(!background)
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -94,7 +99,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             tray::set_window(cc);
             let tray = tray::install(gui_app::app_icon_rgba()).map(|t| Box::new(t) as Box<dyn std::any::Any>);
-            Ok(Box::new(NativeApp::new(manager, rt_handle).with_tray(tray)))
+            Ok(Box::new(NativeApp::new(manager, rt_handle).with_tray(tray).start_hidden(background)))
         }),
     )
 }

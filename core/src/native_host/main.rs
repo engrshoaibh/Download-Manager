@@ -157,6 +157,70 @@ async fn run_task(engine: std::sync::Arc<dm_core::engine::chunked::ChunkedEngine
     }
 }
 
+/// Start the desktop app hidden in the tray unless it already answers on the API port,
+/// then wait until it does. Lets the browser extension wake the app when it is closed.
+async fn ensure_app_running() -> NativeLaunchReply {
+    use std::time::Duration;
+
+    async fn api_up() -> bool {
+        tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(("127.0.0.1", 7373)))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+    }
+
+    if api_up().await {
+        return NativeLaunchReply { status: "RUNNING", message: None };
+    }
+    let gui = match std::env::current_exe() {
+        Ok(exe) => exe.with_file_name(if cfg!(windows) { "dm-gui.exe" } else { "dm-gui" }),
+        Err(e) => return NativeLaunchReply { status: "ERROR", message: Some(e.to_string()) },
+    };
+    if let Err(e) = spawn_detached(&gui) {
+        error!("Could not start {}: {e}", gui.display());
+        return NativeLaunchReply { status: "ERROR", message: Some(format!("could not start {}: {e}", gui.display())) };
+    }
+    info!("Started {}", gui.display());
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if api_up().await {
+            return NativeLaunchReply { status: "LAUNCHED", message: None };
+        }
+    }
+    NativeLaunchReply { status: "ERROR", message: Some("the app did not start listening within 10 seconds".into()) }
+}
+
+/// The browser kills the native host when the extension disconnects, so the app must not
+/// stay in the host's process tree or job object.
+fn spawn_detached(gui: &std::path::Path) -> io::Result<()> {
+    let mut cmd = std::process::Command::new(gui);
+    cmd.arg("--background")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
+        // The browser's job may forbid breakaway; fall back to a plain detached start.
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map(|_| ())
+}
+
+#[derive(Serialize)]
+struct NativeLaunchReply {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // We log to stderr to avoid polluting stdout (which is used for IPC)
@@ -167,23 +231,34 @@ async fn main() -> Result<()> {
 
     info!("dm-native-host started");
 
-    let db_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("download-manager").join("native_db");
-    std::fs::create_dir_all(&db_dir)?;
-
-    let engine = std::sync::Arc::new(
-        dm_core::engine::chunked::ChunkedEngine::new(&db_dir)
-            .expect("Failed to initialize chunked engine")
-    );
+    // Opened on the first download task only: a launch request must not need (or lock) the DB.
+    let mut engine: Option<std::sync::Arc<dm_core::engine::chunked::ChunkedEngine>> = None;
 
     loop {
         match read_message() {
             Ok(Some(buf)) => {
+                let msg_type = serde_json::from_slice::<serde_json::Value>(&buf)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned));
+                if msg_type.as_deref() == Some("launch") {
+                    let reply = ensure_app_running().await;
+                    let _ = write_message(&reply);
+                    continue;
+                }
                 if let Ok(payload) = serde_json::from_slice::<NativeMessagePayload>(&buf) {
                     info!("Received payload: {}", payload.task_id);
-                    let engine = engine.clone();
-                    
+                    if engine.is_none() {
+                        let db_dir = dirs::data_local_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("download-manager").join("native_db");
+                        std::fs::create_dir_all(&db_dir)?;
+                        engine = Some(std::sync::Arc::new(
+                            dm_core::engine::chunked::ChunkedEngine::new(&db_dir)
+                                .expect("Failed to initialize chunked engine"),
+                        ));
+                    }
+                    let engine = engine.clone().expect("engine initialized above");
+
                     tokio::spawn(async move {
                         run_task(engine, payload).await;
                     });
