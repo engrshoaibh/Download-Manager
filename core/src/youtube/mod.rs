@@ -487,8 +487,9 @@ async fn find_or_fetch_ytdlp() -> Result<PathBuf> {
     if let Some(p) = find_ytdlp() {
         return Ok(p);
     }
-    info!("yt-dlp not found — attempting short download window…");
-    match tokio::time::timeout(Duration::from_secs(25), fetch_ytdlp()).await {
+    info!("yt-dlp not found — downloading a managed copy…");
+    // ~18 MB: allow slow connections instead of failing the first YouTube job.
+    match tokio::time::timeout(Duration::from_secs(600), fetch_ytdlp()).await {
         Ok(Ok(p)) => Ok(p),
         Ok(Err(e)) => Err(e).context(ytdlp_install_hint()),
         Err(_) => bail!("{}", ytdlp_install_hint()),
@@ -506,13 +507,10 @@ fn bin_dir() -> PathBuf {
         .join("bin")
 }
 
+/// The managed copy wins over PATH: it is the one the daily updater refreshes, and a stale
+/// yt-dlp stops working when YouTube changes. A PATH copy is used only until the first update.
 fn find_ytdlp() -> Option<PathBuf> {
     let names = ["yt-dlp.exe", "yt-dlp", "ytdlp.exe"];
-    for name in names {
-        if let Ok(path) = which(name) {
-            return Some(path);
-        }
-    }
     let bundled = bin_dir().join(if cfg!(windows) {
         "yt-dlp.exe"
     } else {
@@ -529,6 +527,11 @@ fn find_ytdlp() -> Option<PathBuf> {
                     return Some(p);
                 }
             }
+        }
+    }
+    for name in names {
+        if let Ok(path) = which(name) {
+            return Some(path);
         }
     }
     None
@@ -631,7 +634,7 @@ async fn fetch_ytdlp() -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent("download-manager/0.1")
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(600))
         .build()?;
     let bytes = client
         .get(url)
@@ -1477,9 +1480,9 @@ async fn download_once(
     let target = resolve_youtube_target(url, opts.referer.as_deref())
         .unwrap_or_else(|| url.to_string());
     let is_hls = is_stream_manifest_url(&target);
-    // Stream manifests are remuxed to MP4 by FFmpeg; without it the saved ".mp4" is raw
-    // MPEG-TS. Fetch a managed copy on first use. Other job types keep their old behaviour.
-    if is_hls && ffmpeg.is_none() {
+    // FFmpeg merges YouTube's separate video/audio streams (1080p and up) and remuxes
+    // stream manifests to MP4. Fetch a managed copy on first use so a fresh install works.
+    if ffmpeg.is_none() {
         match tokio::time::timeout(Duration::from_secs(600), find_or_fetch_ffmpeg()).await {
             Ok(Ok(p)) => ffmpeg = Some(p),
             Ok(Err(e)) => warn!("FFmpeg auto-download failed ({e:#}) — continuing without it"),
