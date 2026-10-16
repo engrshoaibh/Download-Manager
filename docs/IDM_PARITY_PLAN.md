@@ -68,13 +68,14 @@ Replace ffmpeg for the common case, matching what `idmvconv` covers:
 
 Done when YouTube downloads in every quality finish without ffmpeg installed.
 
-### Phase 3: Direct YouTube streams (medium)
-- Extension sends the sniffed video URL (chosen itag), the matching audio URL and the cookies to a new `POST /downloads/stream-pair` endpoint.
-- Engine downloads both with the existing segmented engine. googlevideo needs `range=`-style chunking to avoid throttling; `clen=` gives the exact size. Then it calls the Phase 2 muxer.
-- Expired URLs (HTTP 403) pause the job and ask the extension for fresh URLs, reusing the `EXPIRED_URL` flow from `native_host/main.rs`. Move that logic into the engine so the native host stays a thin launcher.
-- yt-dlp becomes the fallback for pasted links and pages where sniffing found nothing.
+### Phase 3: Managed JavaScript runtime for yt-dlp (small) — implemented 2026-10-16
+**Replaces the original "direct YouTube streams" phase.** A check in the browser on 2026-10-16 showed that YouTube's web player now streams with SABR: every request is a `fetch` to `videoplayback?...&sabr=1` with no `itag`, `clen` or `mime`, and the server chooses what to send in a framed format. There are no per-format URLs left to sniff and replay as range downloads; only old videos still serve a classic combined stream (itag 18). So yt-dlp stays the YouTube engine. It handles SABR, ciphers and throttling, and is refreshed daily.
 
-Done when a YouTube video captured from the browser downloads and merges with no yt-dlp, Deno/Node or ffmpeg present.
+What shipped instead removes yt-dlp's last fresh-install gap, its JavaScript runtime:
+- If no Deno/Node/Bun is found, the first YouTube request downloads a managed `deno.exe` (official release zip, ~43 MB) into `%LOCALAPPDATA%\download-manager\bin`, using the same download-and-unpack helper as FFmpeg.
+- Every yt-dlp run gets an explicit `--js-runtimes` value: the managed Deno by path, or whichever of deno/node/bun is on PATH. yt-dlp only enables Deno by default, so a Node-only machine previously had no runtime.
+
+Verified with Deno, Node and Bun hidden from PATH: Deno was installed on the first probe, and yt-dlp reported `JS runtimes: deno-2.9.7`.
 
 ### Phase 4: Own manifest parsing (medium)
 - Parse DASH (`.mpd`, via `quick-xml`) and HLS (`.m3u8`, via `m3u8-rs`) in Rust, then download segments with the engine (`IDMVMPrs` equivalent).
@@ -93,4 +94,4 @@ Done when a YouTube video captured from the browser downloads and merges with no
 
 ## Order
 
-Phase 0 → 1 → 2 → 3 → 4 → 5. Phases 0 and 1 are small and fix real user pain now. Phase 2 must land before Phase 3, because direct streams are only useful once we can merge them without ffmpeg.
+Phase 0 → 1 → 2 → 3 → 4 → 5. Phases 0–3 are done; together they make YouTube work on a fresh install with nothing preinstalled.

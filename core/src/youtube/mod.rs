@@ -19,6 +19,10 @@ const YT_DLP_RELEASE: &str =
 #[cfg(windows)]
 const FFMPEG_RELEASE_ZIP: &str =
     "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
+/// Deno for yt-dlp's YouTube signature/"n" challenges (single deno.exe in the zip root).
+#[cfg(windows)]
+const DENO_RELEASE_ZIP: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 /// `/health` is polled by the UI, the extension and websites — remember the tool scan briefly.
 const HEALTH_CACHE_TTL: Duration = Duration::from_secs(30);
 /// True while a managed FFmpeg download is running (surfaced in `/health`).
@@ -29,6 +33,7 @@ lazy_static::lazy_static! {
         parking_lot::Mutex::new(None);
     /// One FFmpeg download at a time, however many stream jobs start together.
     static ref FFMPEG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+    static ref DENO_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
 }
 
 /// Machine-readable progress line emitted by yt-dlp (`--progress-template`).
@@ -356,6 +361,7 @@ fn regex_height(q: &str) -> Option<u32> {
 pub async fn ensure_tools() -> Result<(PathBuf, Option<PathBuf>)> {
     let ytdlp = find_or_fetch_ytdlp().await?;
     verify_executable(&ytdlp, "yt-dlp").await?;
+    ensure_js_runtime().await;
     let ffmpeg = find_ffmpeg();
     if let Some(ref ff) = ffmpeg {
         if let Err(e) = verify_executable(ff, "ffmpeg").await {
@@ -371,7 +377,7 @@ pub async fn ensure_tools() -> Result<(PathBuf, Option<PathBuf>)> {
 pub async fn verify_tools_at_startup() -> ToolsHealth {
     let mut health = tools_health();
     if !tokio::task::spawn_blocking(has_js_runtime).await.unwrap_or(true) {
-        warn!("No JavaScript runtime (Deno/Node/Bun) found - YouTube formats may be missing. {JS_RUNTIME_HINT}");
+        info!("No JavaScript runtime (Deno/Node/Bun) found - a managed Deno will be downloaded on first YouTube use");
     }
     if health.yt_dlp.available {
         if let Some(ref path) = health.yt_dlp.path {
@@ -765,60 +771,59 @@ async fn fetch_ffmpeg() -> Result<PathBuf> {
     bail!("FFmpeg not found — install ffmpeg with your package manager")
 }
 
+/// Download a zip into the bin dir and unpack the given members with Windows' bsdtar
+/// (Windows 10+ ships it, so no extra dependency). Returns the unpack directory.
 #[cfg(windows)]
-async fn fetch_ffmpeg() -> Result<PathBuf> {
+async fn download_and_unpack(url: &str, name: &str, min_bytes: u64, members: &[&str]) -> Result<PathBuf> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
     let dir = bin_dir();
     std::fs::create_dir_all(&dir).context("create bin dir")?;
-    let zip = dir.join("ffmpeg.zip.partial");
-    let unpack = dir.join("ffmpeg-unpack");
+    let zip = dir.join(format!("{name}.zip.partial"));
+    let unpack = dir.join(format!("{name}-unpack"));
     let _ = std::fs::remove_file(&zip);
     let _ = std::fs::remove_dir_all(&unpack);
 
-    info!("FFmpeg not found — downloading a managed copy…");
     let client = reqwest::Client::builder()
         .user_agent("download-manager/0.1")
         .connect_timeout(Duration::from_secs(15))
         .build()?;
     let resp = client
-        .get(FFMPEG_RELEASE_ZIP)
+        .get(url)
         .send()
         .await
-        .context("download ffmpeg")?
+        .with_context(|| format!("download {name}"))?
         .error_for_status()
-        .context("ffmpeg HTTP error")?;
+        .with_context(|| format!("{name} HTTP error"))?;
 
-    // ~150 MB — stream to disk instead of holding it in memory.
+    // Tens of MB — stream to disk instead of holding it in memory.
     let mut total: u64 = 0;
     {
         let mut file = tokio::fs::File::create(&zip)
             .await
-            .context("create ffmpeg zip")?;
+            .with_context(|| format!("create {name} zip"))?;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read ffmpeg body")?;
+            let chunk = chunk.with_context(|| format!("read {name} body"))?;
             total += chunk.len() as u64;
-            file.write_all(&chunk).await.context("write ffmpeg zip")?;
+            file.write_all(&chunk).await.with_context(|| format!("write {name} zip"))?;
         }
-        file.flush().await.context("flush ffmpeg zip")?;
+        file.flush().await.with_context(|| format!("flush {name} zip"))?;
     }
-    if total < 20_000_000 {
+    if total < min_bytes {
         let _ = std::fs::remove_file(&zip);
-        bail!("ffmpeg download looks too small ({total} bytes)");
+        bail!("{name} download looks too small ({total} bytes)");
     }
 
-    // Windows 10+ ships bsdtar, which reads zip archives — no extra dependency.
-    std::fs::create_dir_all(&unpack).context("create ffmpeg unpack dir")?;
+    std::fs::create_dir_all(&unpack).with_context(|| format!("create {name} unpack dir"))?;
     let mut std_cmd = std::process::Command::new("tar");
     std_cmd
         .arg("-xf")
         .arg(&zip)
         .arg("-C")
         .arg(&unpack)
-        .arg("*/bin/ffmpeg.exe")
-        .arg("*/bin/ffprobe.exe")
+        .args(members)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     {
@@ -830,16 +835,29 @@ async fn fetch_ffmpeg() -> Result<PathBuf> {
     let unpacked = tokio::time::timeout(Duration::from_secs(300), cmd.status()).await;
     let _ = std::fs::remove_file(&zip);
     match unpacked {
-        Ok(Ok(_)) => {}
+        Ok(Ok(_)) => Ok(unpack),
         Ok(Err(e)) => {
             let _ = std::fs::remove_dir_all(&unpack);
-            return Err(e).context("run tar to unpack ffmpeg");
+            Err(e).with_context(|| format!("run tar to unpack {name}"))
         }
         Err(_) => {
             let _ = std::fs::remove_dir_all(&unpack);
-            bail!("unpacking ffmpeg timed out");
+            bail!("unpacking {name} timed out");
         }
     }
+}
+
+#[cfg(windows)]
+async fn fetch_ffmpeg() -> Result<PathBuf> {
+    let dir = bin_dir();
+    info!("FFmpeg not found — downloading a managed copy…");
+    let unpack = download_and_unpack(
+        FFMPEG_RELEASE_ZIP,
+        "ffmpeg",
+        20_000_000,
+        &["*/bin/ffmpeg.exe", "*/bin/ffprobe.exe"],
+    )
+    .await?;
 
     // The archive has one top-level folder: <build-name>/bin/ffmpeg.exe
     let mut found: Option<PathBuf> = None;
@@ -1019,6 +1037,7 @@ pub async fn probe_cancellable(
         }
         
         let mut cmd = Command::from(std_cmd);
+        add_js_runtime(&mut cmd);
 
         if let Some(ref ua) = opts.user_agent {
             if !ua.trim().is_empty() {
@@ -1120,14 +1139,16 @@ fn apply_account_auth(cmd: &mut Command) {
     }
 }
 
-/// Whether a JavaScript runtime yt-dlp can use (Deno, Node, Bun) is on PATH.
-/// Without one, recent yt-dlp cannot solve YouTube's signature challenges and some or
-/// all formats go missing.
-pub fn has_js_runtime() -> bool {
+fn managed_deno() -> PathBuf {
+    bin_dir().join(if cfg!(windows) { "deno.exe" } else { "deno" })
+}
+
+/// First JavaScript runtime on PATH that yt-dlp supports (checked once per process).
+fn path_js_runtime() -> Option<&'static str> {
     use std::sync::OnceLock;
-    static FOUND: OnceLock<bool> = OnceLock::new();
+    static FOUND: OnceLock<Option<&'static str>> = OnceLock::new();
     *FOUND.get_or_init(|| {
-        ["deno", "node", "bun"].iter().any(|bin| {
+        ["deno", "node", "bun"].into_iter().find(|bin| {
             let mut cmd = std::process::Command::new(bin);
             cmd.arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
             #[cfg(windows)]
@@ -1138,6 +1159,71 @@ pub fn has_js_runtime() -> bool {
             cmd.status().map(|s| s.success()).unwrap_or(false)
         })
     })
+}
+
+/// Value for yt-dlp's `--js-runtimes`. yt-dlp only enables Deno by default, so Node/Bun
+/// and our managed Deno (not on PATH) must be named explicitly.
+pub fn js_runtime_arg() -> Option<String> {
+    let managed = managed_deno();
+    if managed.is_file() {
+        return Some(format!("deno:{}", managed.display()));
+    }
+    path_js_runtime().map(str::to_string)
+}
+
+/// Whether yt-dlp has a JavaScript runtime. Without one, recent yt-dlp cannot solve
+/// YouTube's signature challenges and some or all formats go missing.
+pub fn has_js_runtime() -> bool {
+    js_runtime_arg().is_some()
+}
+
+fn add_js_runtime(cmd: &mut Command) {
+    if let Some(rt) = js_runtime_arg() {
+        cmd.arg("--js-runtimes").arg(rt);
+    }
+}
+
+/// Download a managed Deno when no runtime is available, so YouTube works on a fresh
+/// install. Failures are logged; yt-dlp then runs without one, as before.
+async fn ensure_js_runtime() {
+    if tokio::task::spawn_blocking(has_js_runtime).await.unwrap_or(true) {
+        return;
+    }
+    let _guard = DENO_FETCH_LOCK.lock().await;
+    if managed_deno().is_file() {
+        return;
+    }
+    match tokio::time::timeout(Duration::from_secs(600), fetch_deno()).await {
+        Ok(Ok(p)) => info!("Installed Deno → {}", p.display()),
+        Ok(Err(e)) => warn!("Deno auto-download failed ({e:#}). {JS_RUNTIME_HINT}"),
+        Err(_) => warn!("Deno auto-download timed out. {JS_RUNTIME_HINT}"),
+    }
+}
+
+#[cfg(not(windows))]
+async fn fetch_deno() -> Result<PathBuf> {
+    bail!("no JavaScript runtime — install Deno with your package manager")
+}
+
+#[cfg(windows)]
+async fn fetch_deno() -> Result<PathBuf> {
+    info!("No JavaScript runtime found — downloading a managed Deno…");
+    let unpack = download_and_unpack(DENO_RELEASE_ZIP, "deno", 10_000_000, &["deno.exe"]).await?;
+    let from = unpack.join("deno.exe");
+    let dest = managed_deno();
+    let moved = if from.is_file() {
+        let _ = std::fs::remove_file(&dest);
+        std::fs::rename(&from, &dest).context("install deno.exe")
+    } else {
+        Err(anyhow::anyhow!("deno.exe was not found in the downloaded archive"))
+    };
+    let _ = std::fs::remove_dir_all(&unpack);
+    moved?;
+    if let Err(e) = verify_executable(&dest, "deno").await {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    Ok(dest)
 }
 
 const JS_RUNTIME_HINT: &str = "yt-dlp needs a JavaScript runtime for YouTube, and none was found. Install Deno (winget install DenoLand.Deno) or Node.js, restart the app, and try again.";
@@ -1408,6 +1494,7 @@ async fn assert_selected_height(
     opts: &YoutubeOptions,
 ) -> Result<()> {
     let mut cmd = Command::new(ytdlp);
+    add_js_runtime(&mut cmd);
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
         .arg("-f")
@@ -1645,6 +1732,7 @@ async fn download_once(
     }
 
     let mut cmd = Command::new(&ytdlp);
+    add_js_runtime(&mut cmd);
     cmd.arg("--no-playlist")
         .arg("--no-warnings")
         .arg("--newline")

@@ -21,7 +21,7 @@ The desktop app is a native GPU-rendered window (egui), so there is no web view,
 | **Segmentation** | Adaptive connection count, work stealing, HTTP/2, native root certificates for HTTPS on Windows |
 | **Pause & resume** | Survives restarts; stale or missing state triggers a clean restart |
 | **Bandwidth control** | Global speed limit and global connection cap |
-| **YouTube** | Video, audio-only, quality selection, DASH merge via ffmpeg |
+| **YouTube** | Video, audio-only, quality selection, built-in DASH merge (ffmpeg fallback) |
 | **Browser capture** | Link and download interception, video banner, media grabber, HLS/DASH sniffing |
 | **Local API** | REST and WebSocket server on `127.0.0.1:7373` used by the extension |
 | **Self-update** | Checks GitHub releases and replaces the running executable |
@@ -46,7 +46,7 @@ See [extension/README.md](extension/README.md) for details.
 
 ### YouTube tips
 
-YouTube sometimes answers yt-dlp with *"Sign in to confirm you're not a bot"*. If that happens, open **Options → YouTube sign-in** and either point to a `cookies.txt` exported from your browser or choose a browser to read cookies from (Firefox works most reliably). Sending the video from the browser extension also works, because it forwards your session cookies. `ffmpeg` must be installed for formats that need audio and video merged.
+YouTube sometimes answers yt-dlp with *"Sign in to confirm you're not a bot"*. If that happens, open **Options → YouTube sign-in** and either point to a `cookies.txt` exported from your browser or choose a browser to read cookies from (Firefox works most reliably). Sending the video from the browser extension also works, because it forwards your session cookies. Nothing needs to be installed by hand: the app downloads and updates `yt-dlp` itself, merges video and audio with its own muxer (falling back to an auto-downloaded `ffmpeg` only for other formats), and downloads a private copy of Deno if no JavaScript runtime (Deno, Node or Bun) is present. These tools live in `%LOCALAPPDATA%\download-manager\bin`.
 
 ## 🛠️ Building from Source
 
