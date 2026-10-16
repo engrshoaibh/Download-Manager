@@ -208,6 +208,64 @@ pub fn format_selector(opts: &YoutubeOptions) -> String {
     "bv*+ba/b".into()
 }
 
+/// Rewrite a selector so every `video+audio` choice is a same-container pair
+/// (mp4 + m4a, else webm + webm), which the built-in muxer can join without FFmpeg.
+/// A plain "best" becomes a height ladder so a WebM-only top resolution still wins.
+pub fn same_container_pairs(selector: &str) -> String {
+    let ladder;
+    let selector = if selector == "bv*+ba/b" {
+        ladder = [4320, 2160, 1440, 1080, 720, 480, 360]
+            .iter()
+            .map(|h| format!("bv*[height>={h}]+ba"))
+            .chain(["bv*+ba".to_string(), "b".to_string()])
+            .collect::<Vec<_>>()
+            .join("/");
+        ladder.as_str()
+    } else {
+        selector
+    };
+    selector
+        .split('/')
+        .map(|alt| match alt.split_once('+') {
+            Some((v, a)) => format!("{v}[ext=mp4]+{a}[ext=m4a]/{v}[ext=webm]+{a}[ext=webm]"),
+            None => alt.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// yt-dlp without FFmpeg leaves `<stem>.f<id>.<ext>` files instead of merging. Join a
+/// video/audio pair with the built-in muxer; `None` when there is nothing to join.
+async fn mux_split_formats(work_dir: &Path, stem: &str) -> Result<Option<PathBuf>> {
+    let prefix = format!("{stem}.f");
+    let mut parts: Vec<PathBuf> = std::fs::read_dir(work_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            name.starts_with(&prefix) && matches!(ext.as_str(), "mp4" | "m4a" | "webm")
+        })
+        .collect();
+    if parts.len() != 2 {
+        return Ok(None);
+    }
+    parts.sort();
+    let kind = crate::mux::detect(&parts[0])?;
+    let ext = if kind == Some(crate::mux::Container::Webm) { "webm" } else { "mp4" };
+    let out = work_dir.join(format!("{stem}.{ext}"));
+    let (a, b, dest) = (parts[0].clone(), parts[1].clone(), out.clone());
+    info!("Merging {} + {} with the built-in muxer", a.display(), b.display());
+    tokio::task::spawn_blocking(move || crate::mux::mux_av(&a, &b, &dest, &mut |_, _| true))
+        .await
+        .context("muxer task")?
+        .map_err(|e| anyhow::anyhow!("could not merge video and audio without FFmpeg: {e}"))?;
+    for p in &parts {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(Some(out))
+}
+
 /// Selector for direct HLS/DASH manifests — height filters often report 0p and fail.
 pub fn stream_manifest_selector(opts: &YoutubeOptions) -> String {
     if let Some(f) = explicit_format_id(opts) {
@@ -1494,6 +1552,10 @@ async fn download_once(
     } else {
         format_selector(opts)
     };
+    // Without FFmpeg, yt-dlp saves video and audio as two files; ask only for pairs in one
+    // container so the built-in muxer can join them (see `mux_split_formats`).
+    let builtin_merge = ffmpeg.is_none() && !is_hls;
+    let selector = if builtin_merge { same_container_pairs(&selector) } else { selector };
     /* Container hint from extension (mp4/ts) — not a yt-dlp -f id */
     let container_hint = opts
         .format
@@ -1913,6 +1975,14 @@ async fn download_once(
             "yt-dlp exited with {status}. stderr tail:\n{}",
             truncate_for_log(&tail, 2000)
         );
+    }
+
+    if builtin_merge {
+        last_progress.phase = "merging".into();
+        on_progress(last_progress.clone());
+        if let Some(merged) = mux_split_formats(&work_dir, &stem).await? {
+            final_path = Some(merged);
+        }
     }
 
     let path = if let Some(p) = final_path.filter(|p| p.exists()) {
@@ -2407,5 +2477,31 @@ mod cookie_tests {
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(out.contains(".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc"));
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod same_container_tests {
+    use super::*;
+
+    #[test]
+    fn pairs_stay_in_one_container() {
+        assert_eq!(
+            same_container_pairs("313+bestaudio/ba"),
+            "313[ext=mp4]+bestaudio[ext=m4a]/313[ext=webm]+bestaudio[ext=webm]/ba"
+        );
+        assert_eq!(same_container_pairs("ba/b"), "ba/b");
+        let best = same_container_pairs("bv*+ba/b");
+        assert!(best.starts_with("bv*[height>=4320][ext=mp4]+ba[ext=m4a]/bv*[height>=4320][ext=webm]+ba[ext=webm]/"));
+        assert!(best.ends_with("/bv*[ext=webm]+ba[ext=webm]/b"));
+    }
+
+    #[test]
+    #[ignore = "prints selectors for manual yt-dlp checks"]
+    fn print_selectors() {
+        for q in ["best", "1080", "2160", "720"] {
+            let opts = YoutubeOptions { quality: Some(q.into()), ..Default::default() };
+            println!("SEL {}", same_container_pairs(&format_selector(&opts)));
+        }
     }
 }

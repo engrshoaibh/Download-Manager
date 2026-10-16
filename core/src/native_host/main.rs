@@ -109,20 +109,16 @@ async fn run_task(engine: std::sync::Arc<dm_core::engine::chunked::ChunkedEngine
     }
 
     info!("Multiplexing {}", payload.task_id);
-    let ffmpeg = dm_core::youtube::find_ffmpeg().unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    let mut cmd = tokio::process::Command::new(&ffmpeg);
-    cmd.arg("-y")
-        .arg("-i").arg(&video_tmp)
-        .arg("-i").arg(&audio_tmp)
-        .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"])
-        .arg(&mux_tmp);
-    // CREATE_NO_WINDOW: never flash a console window while muxing.
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let output = cmd.output().await;
+    let muxed = match builtin_mux(&video_tmp, &audio_tmp, &mux_tmp, &ext).await {
+        Ok(()) => Ok(()),
+        Err(why) => {
+            info!("Built-in muxer not used ({why}); falling back to FFmpeg");
+            ffmpeg_mux(&video_tmp, &audio_tmp, &mux_tmp).await
+        }
+    };
 
-    match output {
-        Ok(o) if o.status.success() && mux_tmp.exists() => {
+    match muxed {
+        Ok(()) => {
             let _ = std::fs::remove_file(&out);
             if let Err(e) = std::fs::rename(&mux_tmp, &out) {
                 let _ = write_message(&NativeMessageEvent::Error {
@@ -139,21 +135,53 @@ async fn run_task(engine: std::sync::Arc<dm_core::engine::chunked::ChunkedEngine
                 final_path: payload.output_path,
             });
         }
-        Ok(o) => {
+        Err((code, message)) => {
             let _ = std::fs::remove_file(&mux_tmp);
             let _ = write_message(&NativeMessageEvent::Error {
                 task_id: payload.task_id.clone(),
-                error_code: "MUX_FAILED".into(),
-                message: String::from_utf8_lossy(&o.stderr).into_owned(),
+                error_code: code.into(),
+                message,
             });
         }
-        Err(e) => {
-            let _ = write_message(&NativeMessageEvent::Error {
-                task_id: payload.task_id.clone(),
-                error_code: "FFMPEG_MISSING".into(),
-                message: e.to_string(),
-            });
+    }
+}
+
+/// Join the streams with the built-in muxer when the inputs and the requested
+/// extension allow it (MP4 into .mp4, WebM into .webm/.mkv). No FFmpeg needed.
+async fn builtin_mux(video: &std::path::Path, audio: &std::path::Path, out: &std::path::Path, ext: &str) -> Result<(), String> {
+    use dm_core::mux::{self, Container};
+    let (video, audio, out, ext) = (video.to_path_buf(), audio.to_path_buf(), out.to_path_buf(), ext.to_ascii_lowercase());
+    tokio::task::spawn_blocking(move || {
+        let wanted = match ext.as_str() {
+            "mp4" | "m4v" => Container::Mp4,
+            "webm" | "mkv" => Container::Webm,
+            other => return Err(format!(".{other} output")),
+        };
+        let found = mux::detect(&video).map_err(|e| e.to_string())?;
+        if found != Some(wanted) {
+            return Err(format!("{found:?} input for .{ext} output"));
         }
+        mux::mux_av(&video, &audio, &out, &mut |_, _| true).map(|_| ()).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn ffmpeg_mux(video: &std::path::Path, audio: &std::path::Path, out: &std::path::Path) -> Result<(), (&'static str, String)> {
+    let ffmpeg = dm_core::youtube::find_ffmpeg().unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
+    let mut cmd = tokio::process::Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .arg("-i").arg(video)
+        .arg("-i").arg(audio)
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"])
+        .arg(out);
+    // CREATE_NO_WINDOW: never flash a console window while muxing.
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    match cmd.output().await {
+        Ok(o) if o.status.success() && out.exists() => Ok(()),
+        Ok(o) => Err(("MUX_FAILED", String::from_utf8_lossy(&o.stderr).into_owned())),
+        Err(e) => Err(("FFMPEG_MISSING", e.to_string())),
     }
 }
 

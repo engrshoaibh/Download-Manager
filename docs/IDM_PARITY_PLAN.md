@@ -57,7 +57,8 @@ Host name `com.dmpro.native_host`; the extension ID is pinned to `ekgkljpblmhpfj
 
 Done when closing the app fully, then clicking download in the browser starts the app in the tray and the download goes through.
 
-### Phase 2: Built-in muxer (`core/src/mux/`, medium–large)
+### Phase 2: Built-in muxer (`core/src/mux/`, medium–large) — implemented 2026-10-16
+Status: `mux::mux_av` handles fMP4+fMP4 → MP4 (with `mfra`, plus an edit list for the B-frame delay) and WebM+WebM → WebM/MKV (with Cues). Tests in `core/tests/mux.rs` decode the output with FFmpeg. The native host tries it before FFmpeg. With no FFmpeg, the yt-dlp path asks only for same-container pairs (`same_container_pairs`) and merges yt-dlp's split `.fNNN` files itself. Still open: mixed MP4 video + WebM audio, and MPEG-TS, both of which use FFmpeg.
 Replace ffmpeg for the common case, matching what `idmvconv` covers:
 - **fMP4 video + fMP4/M4A audio → MP4.** This is YouTube's H.264/AV1 + AAC. Read both `moov`s, write one `moov` with two `trak`s and `mvex`, then copy `moof`/`mdat` pairs with track IDs rewritten. Copy only, never re-encode.
 - **WebM video + WebM audio → MKV/WebM.** This is VP9 + Opus. EBML: merge `Tracks`, re-number tracks, interleave `Cluster`s by timecode.
