@@ -213,6 +213,82 @@ pub fn format_selector(opts: &YoutubeOptions) -> String {
     "bv*+ba/b".into()
 }
 
+/// Download an HLS/DASH manifest with [`crate::stream`] in the job's hidden work dir,
+/// finish it (built-in muxer, FFmpeg only for MPEG-TS), and move it into `save_dir`.
+async fn download_stream_native(
+    job_id: uuid::Uuid,
+    url: &str,
+    save_dir: &Path,
+    preferred_name: Option<&str>,
+    opts: &YoutubeOptions,
+    stop: &Arc<AtomicBool>,
+    on_progress: &mut (impl FnMut(YoutubeProgress) + Send),
+) -> std::result::Result<PathBuf, crate::stream::StreamError> {
+    use crate::stream::{self, StreamError};
+
+    std::fs::create_dir_all(save_dir).map_err(anyhow::Error::from)?;
+    let mut yt_temp = HiddenYtTemp::create(save_dir, job_id)?;
+    let work_dir = yt_temp.job_dir.join("native");
+    std::fs::create_dir_all(&work_dir).map_err(anyhow::Error::from)?;
+
+    let req = stream::Request {
+        url: url.to_string(),
+        quality: opts.quality.clone(),
+        user_agent: opts.user_agent.clone(),
+        cookies: opts.cookies.clone(),
+        referer: opts.referer.clone(),
+    };
+    let started = std::time::Instant::now();
+    let mut first_bytes: Option<u64> = None;
+    let mut report = |p: stream::Progress| {
+        // Speed over this session only (resumed bytes don't count).
+        let base = *first_bytes.get_or_insert(p.downloaded);
+        let secs = started.elapsed().as_secs_f64().max(0.5);
+        let speed = (p.downloaded - base) as f64 / secs;
+        let total = p.total_estimate.max(p.downloaded);
+        on_progress(YoutubeProgress {
+            percent: if total > 0 { p.downloaded as f64 * 100.0 / total as f64 } else { 0.0 },
+            downloaded_bytes: p.downloaded,
+            total_bytes: total,
+            speed_bps: speed,
+            eta_seconds: (speed > 1.0).then(|| total.saturating_sub(p.downloaded) as f64 / speed),
+            phase: "downloading".into(),
+            filename: None,
+            is_estimate: true,
+        });
+    };
+    let dl = stream::download(&req, &work_dir, Arc::clone(stop), &mut report).await?;
+
+    on_progress(YoutubeProgress { phase: "merging".into(), ..Default::default() });
+    let stem = preferred_name
+        .and_then(|n| Path::new(n).file_stem().and_then(|s| s.to_str()))
+        .map(sanitize_filename)
+        .unwrap_or_else(|| "video".into());
+    let finished = match stream::finish(&dl, &work_dir, &stem, None).await {
+        Err(StreamError::NeedsFfmpeg) => {
+            let ff = tokio::time::timeout(Duration::from_secs(600), find_or_fetch_ffmpeg())
+                .await
+                .map_err(|_| anyhow::anyhow!("FFmpeg download timed out"))??;
+            stream::finish(&dl, &work_dir, &stem, Some(&ff)).await?
+        }
+        other => other?,
+    };
+
+    let visible = move_finished_to_save_dir(&finished, save_dir, preferred_name.unwrap_or(&stem))?;
+    yt_temp.cleanup();
+    let size = std::fs::metadata(&visible).map(|m| m.len()).unwrap_or(0);
+    on_progress(YoutubeProgress {
+        percent: 100.0,
+        downloaded_bytes: size,
+        total_bytes: size,
+        eta_seconds: Some(0.0),
+        phase: "done".into(),
+        filename: Some(visible.display().to_string()),
+        ..Default::default()
+    });
+    Ok(visible)
+}
+
 /// Rewrite a selector so every `video+audio` choice is a same-container pair
 /// (mp4 + m4a, else webm + webm), which the built-in muxer can join without FFmpeg.
 /// A plain "best" becomes a height ladder so a WebM-only top resolution still wins.
@@ -1565,8 +1641,19 @@ pub async fn download(
     known_total: Option<u64>,
     stop: Arc<AtomicBool>,
     pid_slot: Arc<AtomicU32>,
-    mut on_progress: impl FnMut(YoutubeProgress),
+    mut on_progress: impl FnMut(YoutubeProgress) + Send,
 ) -> Result<PathBuf> {
+    // HLS/DASH: our own segment downloader first; yt-dlp only for what it can't handle.
+    if is_stream_manifest_url(url) {
+        match download_stream_native(job_id, url, save_dir, preferred_name, opts, &stop, &mut on_progress).await {
+            Ok(path) => return Ok(path),
+            Err(crate::stream::StreamError::Unsupported(why)) => {
+                info!("Native HLS/DASH downloader skipped ({why}); using yt-dlp");
+            }
+            Err(crate::stream::StreamError::Stopped) => bail!("stopped"),
+            Err(e) => return Err(anyhow::anyhow!("{e:#}")),
+        }
+    }
     let mut last_err = String::new();
     for attempt in 1..=2u32 {
         match download_once(

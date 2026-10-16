@@ -77,7 +77,8 @@ What shipped instead removes yt-dlp's last fresh-install gap, its JavaScript run
 
 Verified with Deno, Node and Bun hidden from PATH: Deno was installed on the first probe, and yt-dlp reported `JS runtimes: deno-2.9.7`.
 
-### Phase 4: Own manifest parsing (medium)
+### Phase 4: Own manifest parsing (medium) — implemented 2026-10-16
+Status: `core/src/stream/` parses HLS (master/media, byte ranges, AES-128, fMP4 init) and static single-period DASH (`SegmentTemplate` with `$Number$` or `SegmentTimeline`, `SegmentList`, `SegmentBase`). It picks the variant for the job's quality and downloads 8 segments at a time, written in order, with resume. Separate audio is joined by the Phase 2 muxer; FFmpeg is fetched only to remux MPEG-TS. `youtube::download()` uses it for every manifest URL and falls back to yt-dlp for live streams, DRM (`ContentProtection`, SAMPLE-AES, non-identity key formats), multi-period DASH and changing init sections. Tests: unit tests in each parser, plus `core/tests/stream.rs` against a local range-capable server (fMP4 master with separate audio, DASH timeline, AES-128 TS, pause/resume giving byte-identical output, live fallback).
 - Parse DASH (`.mpd`, via `quick-xml`) and HLS (`.m3u8`, via `m3u8-rs`) in Rust, then download segments with the engine (`IDMVMPrs` equivalent).
 - fMP4 segments go through the Phase 2 muxer. MPEG-TS keeps the ffmpeg fallback until we add a TS→MP4 remuxer (`MuxTSandTStoMP4` equivalent) as a later step.
 
@@ -94,4 +95,4 @@ Verified with Deno, Node and Bun hidden from PATH: Deno was installed on the fir
 
 ## Order
 
-Phase 0 → 1 → 2 → 3 → 4 → 5. Phases 0–3 are done; together they make YouTube work on a fresh install with nothing preinstalled.
+Phase 0 → 1 → 2 → 3 → 4 → 5. Phases 0–4 are done. YouTube works on a fresh install with nothing preinstalled, and HLS/DASH sites no longer need yt-dlp. Phase 5 (polish) is what's left.

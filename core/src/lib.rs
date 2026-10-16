@@ -5,6 +5,7 @@ pub mod mux;
 pub mod network;
 pub mod persist;
 pub mod settings;
+pub mod stream;
 pub mod updater;
 pub mod youtube;
 
