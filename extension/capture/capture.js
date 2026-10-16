@@ -58,26 +58,17 @@ elName.value =
     elSeg.title = 'Direct googlevideo stream — multi-segment HTTP download';
   }
 
-  const health = await chrome.runtime.sendMessage({ type: 'CHECK_DAEMON' });
-  if (!health?.ok) {
-    setStatus(health?.error || 'App offline — open Download Manager Pro', 'error');
-  } else if (isCdn) {
-    const sizeHint = finalSize > 0 ? ` · ${(finalSize / (1024 * 1024)).toFixed(0)} MB` : '';
-    setStatus(`Direct stream · segmented download${sizeHint}`, 'ok');
-  } else if (isYt) {
-    if (!finalSize) {
-      setStatus(`YouTube processor · ${quality || 'best'} (probing size…)`, 'ok');
-      try {
-        const info = await probeYoutube(url);
-        finalSize = estimateSizeFromProbe(info, quality || 'best') || 0;
-      } catch (err) {
-        console.error('Probe failed:', err);
-      }
+  /*
+   * No app status here: Start wakes the app through the native host when it is closed,
+   * and real failures are shown when Start fails. Only fetch the YouTube size quietly.
+   */
+  if (isYt && !isCdn && !finalSize) {
+    try {
+      const info = await probeYoutube(url);
+      finalSize = estimateSizeFromProbe(info, quality || 'best') || 0;
+    } catch (err) {
+      console.error('Probe failed:', err);
     }
-    const sizeHint = finalSize > 0 ? ` · ~${(finalSize / (1024 * 1024)).toFixed(0)} MB` : '';
-    setStatus(`YouTube processor · ${quality || 'best'}${sizeHint}`, 'ok');
-  } else if (quality && quality !== 'Default') {
-    setStatus(`Quality: ${quality}`, 'ok');
   }
 })();
 
