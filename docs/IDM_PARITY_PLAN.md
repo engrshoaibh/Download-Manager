@@ -82,7 +82,8 @@ Status: `core/src/stream/` parses HLS (master/media, byte ranges, AES-128, fMP4 
 - Parse DASH (`.mpd`, via `quick-xml`) and HLS (`.m3u8`, via `m3u8-rs`) in Rust, then download segments with the engine (`IDMVMPrs` equivalent).
 - fMP4 segments go through the Phase 2 muxer. MPEG-TS keeps the ffmpeg fallback until we add a TS→MP4 remuxer (`MuxTSandTStoMP4` equivalent) as a later step.
 
-### Phase 5: Polish (small, optional)
+### Phase 5: Polish (small, optional) — partly done 2026-10-16
+Status: the modifier keys are implemented, using IDM's convention. Alt+click now lets the browser download the link (the extension tells the background worker to let that download through), and holding Insert while clicking forces capture. This replaces the old "Alt+click forces capture" option; the popup has a switch for each. Store publishing needs your Chrome Web Store / Edge Add-ons developer account, so it is left for you. Once the extension has a store ID, add the installer registry key below. Translations are still deferred.
 - Hold Alt while clicking a link to let the browser download it, Insert to force capture. This lives in the extension content script, so no system-wide hooks are needed (`idmmkb` equivalent).
 - Publish the extension to the Chrome Web Store and Edge Add-ons, then have the installer write the `Software\Google\Chrome\Extensions\<id>` key (with `update_url`) so the browser offers it automatically.
 - Translations, once the UI text settles.

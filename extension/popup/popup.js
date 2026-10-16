@@ -8,7 +8,8 @@ const els = {
   catchVideoPageLinks: document.getElementById('catchVideoPageLinks'),
   videoBanner: document.getElementById('videoBanner'),
   mediaGrabber: document.getElementById('mediaGrabber'),
-  altClickCapture: document.getElementById('altClickCapture'),
+  altSkipsCapture: document.getElementById('altSkipsCapture'),
+  insertForcesCapture: document.getElementById('insertForcesCapture'),
   segments: document.getElementById('segments'),
   extensions: document.getElementById('extensions'),
   daemon: document.getElementById('daemon'),
@@ -37,7 +38,8 @@ async function hydrate() {
   els.catchVideoPageLinks.checked = s.catchVideoPageLinks === true;
   els.videoBanner.checked = s.videoBanner !== false;
   els.mediaGrabber.checked = s.mediaGrabber;
-  els.altClickCapture.checked = s.altClickCapture;
+  els.altSkipsCapture.checked = s.altSkipsCapture !== false;
+  els.insertForcesCapture.checked = s.insertForcesCapture !== false;
   els.segments.value = String(s.segments || 16);
   els.extensions.value = (s.extensions || DEFAULT_SETTINGS.extensions).join(', ');
   await refreshDaemon();
@@ -57,7 +59,8 @@ els.save.addEventListener('click', async () => {
     catchVideoPageLinks: els.catchVideoPageLinks.checked,
     videoBanner: els.videoBanner.checked,
     mediaGrabber: els.mediaGrabber.checked,
-    altClickCapture: els.altClickCapture.checked,
+    altSkipsCapture: els.altSkipsCapture.checked,
+    insertForcesCapture: els.insertForcesCapture.checked,
     segments: Number(els.segments.value) || 16,
     extensions: extensions.length ? extensions : DEFAULT_SETTINGS.extensions,
   });

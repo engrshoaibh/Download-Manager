@@ -37,9 +37,13 @@
         <span>Open dialog on link click</span>
         <input type="checkbox" id="linkClickCapture" class="switch" />
       </label>
-      <label class="row">
-        <span>Alt+click forces capture</span>
-        <input type="checkbox" id="altClickCapture" class="switch" />
+      <label class="row" title="Hold Alt while clicking a link to download it with the browser instead">
+        <span>Alt+click uses the browser</span>
+        <input type="checkbox" id="altSkipsCapture" class="switch" />
+      </label>
+      <label class="row" title="Hold Insert while clicking a link to capture it even if its type isn't in the list">
+        <span>Insert+click forces capture</span>
+        <input type="checkbox" id="insertForcesCapture" class="switch" />
       </label>
     </section>
 

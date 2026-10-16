@@ -23,8 +23,10 @@ export const DEFAULT_SETTINGS = {
   extensions: DEFAULT_EXTENSIONS,
   /** Skip tiny assets (favicon etc.) when sniffing — bytes; 0 = no min */
   minSizeHint: 0,
-  /** Alt+click always captures even if extension not in list */
-  altClickCapture: true,
+  /** Hold Alt while clicking a link to let the browser download it (IDM convention). */
+  altSkipsCapture: true,
+  /** Hold Insert while clicking a link to capture it even if its type isn't in the list. */
+  insertForcesCapture: true,
   /** Catch link clicks and open the download dialog (IDM Integration style) */
   linkClickCapture: true,
   /** Also catch YouTube / video page links on click (off — use player banner instead) */

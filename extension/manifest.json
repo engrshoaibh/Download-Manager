@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Download Manager Pro Integration",
   "short_name": "DM Capture",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5b7OWsz9Lz9ndWqP2mBhDwyDTqUG/gRTIGLrxNMnwYisC1gC08S1PJWXou6jJASYFl3UB3mMYoYGW7ThEKREP+iOMn0wUxY4ActVei/vR96NZ4ZvrAbQs0nh1oCVYqm/3bRwygIqI3MoGa6TrE2ZcEUTpEi1+jNj5f8pDH5Ju2CdTEI9XOkEHh+ijjl1/cAGdKPzf0wdNJhjp1Yp0nZls1vVCnjUgm4cQD4h5z+ksnx90qIQe46dWIdfY3jm7XTLnCvfeMmDWSPCDiZDWvFsGR51RbDuj9rjk5N0e7KfTW65Z2XpHgiabbgkJ9Yx08c/B2WKTzIwfFtku9sYUN0ZqQIDAQAB",
   "description": "IDM-style sniffer — HLS/DASH/MP4 capture, YouTube quality menu, daemon handoff.",
   "icons": {

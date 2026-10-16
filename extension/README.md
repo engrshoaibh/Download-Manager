@@ -10,7 +10,8 @@ IDM-style **Internet Download Module** for this project: sniffs downloadable URL
 | Confirm dialog | Ask mode opens an IDM-style “Download File” popup |
 | **Video download banner** | Overlay on HTML5 players — click to pick resolution |
 | Link sniffing | Click capture on zip/exe/pdf/video/… links |
-| Alt+click | Force-capture any link |
+| Alt+click | Let the browser download the link instead |
+| Insert held + click | Capture any link, even if its type isn't in the list |
 | Context menu | “Download with Download Manager” on links & media |
 | Media grabber | Floating panel listing video/audio/sources on the page |
 | Session pass-through | Sends cookies + UA so authenticated downloads work |

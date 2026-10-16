@@ -50,6 +50,8 @@ import {
 const recentCaptures = new Map();
 /** URLs the user explicitly chose to open in the browser. */
 const browserAllow = new Map();
+/** Alt+click: let the next browser download through even if a redirect changed its URL. */
+let skipCaptureUntil = 0;
 /** tabId -> Map(url -> media item) sniffed from network */
 const tabMedia = new Map();
 const RECENT_TTL_MS = 15_000;
@@ -593,7 +595,11 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
   const url = item.finalUrl || item.url;
   if (!url || url.startsWith('blob:') || url.startsWith('data:')) return;
-  if (isBrowserAllowed(url) || wasRecent(url)) return;
+  if (Date.now() < skipCaptureUntil) {
+    skipCaptureUntil = 0;
+    return;
+  }
+  if (isBrowserAllowed(url) || isBrowserAllowed(item.url) || wasRecent(url)) return;
   if (!shouldCapture(url, settings)) return;
 
   try {
@@ -632,6 +638,11 @@ async function handleMessage(msg, sender) {
 
     case 'CHECK_DAEMON':
       return { ok: true, ...(await checkDaemon()) };
+
+    case 'SKIP_CAPTURE':
+      if (msg.url) allowBrowserOnce(msg.url);
+      skipCaptureUntil = Date.now() + 5000;
+      return { ok: true };
 
     case 'CAPTURE_URL': {
       const url = msg.url;

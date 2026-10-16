@@ -12,6 +12,8 @@
   /** IDM-style: only show banner after playback has started */
   const startedVideos = new WeakSet();
   let settings = null;
+  /** Insert is held down (IDM: hold Insert + click to force capture). */
+  let insertHeld = false;
   let mediaPanel = null;
   let sniffTimer = null;
   let bannerTimer = null;
@@ -53,6 +55,9 @@
     if (isTop) {
       document.addEventListener('click', onClick, true);
       document.addEventListener('auxclick', onAuxClick, true);
+      window.addEventListener('keydown', (e) => { if (e.key === 'Insert') insertHeld = true; }, true);
+      window.addEventListener('keyup', (e) => { if (e.key === 'Insert') insertHeld = false; }, true);
+      window.addEventListener('blur', () => { insertHeld = false; });
       /* Bubble phase so the banner button can open the menu without racing a capture closer */
       document.addEventListener('click', closeMenusOnOutside, false);
     }
@@ -303,18 +308,30 @@
     fillMenuList(ul, sorted);
   }
 
+  /** Hold Alt: the user wants the browser to handle this link (Chrome downloads on Alt+click). */
+  function skipsCapture(e) {
+    if (!e.altKey || settings?.altSkipsCapture === false) return false;
+    const href = e.target?.closest?.('a[href]')?.href;
+    if (href) runtimeSend({ type: 'SKIP_CAPTURE', url: unwrapHref(href) });
+    return true;
+  }
+
+  function forcesCapture() {
+    return insertHeld && settings?.insertForcesCapture !== false;
+  }
+
   function onAuxClick(e) {
     if (e.button !== 1) return;
-    const force = e.altKey && (settings?.altClickCapture !== false);
-    handlePotentialDownload(e, force);
+    if (skipsCapture(e)) return;
+    handlePotentialDownload(e, forcesCapture());
   }
 
   function onClick(e) {
     if (e.button !== 0) return;
     if (e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (e.target?.closest?.('.dm-video-banner, .dm-res-menu, #dm-media-grabber, #dm-toast')) return;
-    const force = e.altKey && (settings?.altClickCapture !== false);
-    handlePotentialDownload(e, force);
+    if (skipsCapture(e)) return;
+    handlePotentialDownload(e, forcesCapture());
   }
 
   function closeMenusOnOutside(e) {
