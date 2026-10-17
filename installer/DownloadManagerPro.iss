@@ -75,7 +75,17 @@ Root: HKCU; Subkey: "Software\Chromium\NativeMessagingHosts\com.dmpro.native_hos
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+; In-app update: the app quit for the silent install, so start the new version.
+; (RestartApplications only restarts apps registered with Restart Manager, which this one isn't.)
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: IsAppUpdate
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.bak"
 Type: files; Name: "{app}\*.partial"
+
+[Code]
+{ The in-app updater runs this installer with /RELAUNCH=1. }
+function IsAppUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;

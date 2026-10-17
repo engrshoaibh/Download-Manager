@@ -98,7 +98,8 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             tray::set_window(cc);
-            let tray = tray::install(gui_app::app_icon_rgba()).map(|t| Box::new(t) as Box<dyn std::any::Any>);
+            let tray = tray::install(gui_app::app_icon_rgba(), rt_handle.clone()).map(|t| Box::new(t) as Box<dyn std::any::Any>);
+            tray::spawn_update_notifier(&rt_handle);
             Ok(Box::new(NativeApp::new(manager, rt_handle).with_tray(tray).start_hidden(background)))
         }),
     )
