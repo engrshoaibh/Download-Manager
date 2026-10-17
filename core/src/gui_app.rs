@@ -17,7 +17,6 @@ pub enum ThemeMode {
 pub struct ThemeColors {
     pub bg_app: Color32,          // Surface 1: Base background (#0d0d0d)
     pub bg_chrome: Color32,       // Surface 2: Panel/sidebar/toolbar/statusbar (#161616)
-    pub bg_card: Color32,         // Surface 3: Row/card container background (#1f1f1f)
     pub bg_raised: Color32,       // Surface 3b: Toolbar buttons/inputs/toolcards (#1a1a1a)
     pub bg_input: Color32,
     pub bg_row_hover: Color32,
@@ -36,8 +35,6 @@ pub struct ThemeColors {
     pub warning: Color32,         // Amber (#fbbf24)
     pub probing_blue: Color32,    // Connecting blue (#38bdf8)
     pub progress_track: Color32,  // Visible track (#2a2a2a) so 0% reads as a bar
-    pub badge_bg: Color32,        // Badge pill background (#2a2a2a)
-    pub badge_text: Color32,      // Badge pill text color
 }
 
 impl ThemeColors {
@@ -45,7 +42,6 @@ impl ThemeColors {
         Self {
             bg_app: Color32::from_rgb(244, 245, 247),       // #f4f5f7
             bg_chrome: Color32::from_rgb(255, 255, 255),    // #ffffff
-            bg_card: Color32::from_rgb(255, 255, 255),      // #ffffff
             bg_raised: Color32::from_rgb(243, 244, 246),    // #f3f4f6
             bg_input: Color32::from_rgb(255, 255, 255),     // #ffffff
             bg_row_hover: Color32::from_rgba_unmultiplied(0, 0, 0, 10),
@@ -64,8 +60,6 @@ impl ThemeColors {
             warning: Color32::from_rgb(245, 158, 11),       // #f59e0b
             probing_blue: Color32::from_rgb(14, 165, 233),  // #0ea5e9
             progress_track: Color32::from_rgb(229, 231, 235), // #e5e7eb
-            badge_bg: Color32::from_rgb(229, 231, 235),       // #e5e7eb
-            badge_text: Color32::from_rgb(75, 85, 99),
         }
     }
 
@@ -73,7 +67,6 @@ impl ThemeColors {
         Self {
             bg_app: Color32::from_rgb(11, 14, 23),
             bg_chrome: Color32::from_rgb(14, 18, 29),
-            bg_card: Color32::from_rgb(18, 23, 36),
             bg_raised: Color32::from_rgb(22, 28, 43),
             bg_input: Color32::from_rgb(16, 20, 32),
             bg_row_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 9),
@@ -92,8 +85,6 @@ impl ThemeColors {
             warning: Color32::from_rgb(251, 191, 36),
             probing_blue: Color32::from_rgb(56, 189, 248),
             progress_track: Color32::from_rgb(34, 41, 60),
-            badge_bg: Color32::from_rgb(34, 41, 60),
-            badge_text: Color32::from_rgb(209, 213, 219),
         }
     }
 }
@@ -436,22 +427,6 @@ impl NativeApp {
         }
     }
 
-    fn stop_all(&mut self) {
-        let mgr = Arc::clone(&self.manager);
-        self.rt.spawn(async move {
-            let mut guard = mgr.write().await;
-            let active_ids: Vec<JobId> = guard
-                .jobs
-                .iter()
-                .filter(|(_, j)| matches!(j.status, DownloadStatus::Downloading | DownloadStatus::Probing | DownloadStatus::Queued))
-                .map(|(id, _)| *id)
-                .collect();
-            for id in active_ids {
-                guard.pause(&id);
-            }
-        });
-    }
-
     fn open_file(&self, path: &str) {
         let _ = open::that(path);
     }
@@ -516,26 +491,6 @@ fn format_speed(bps: f64) -> String {
     }
 }
 
-fn format_eta(eta_opt: Option<f64>) -> String {
-    if let Some(eta) = eta_opt {
-        if eta.is_finite() && eta > 0.0 && eta < 86400.0 * 30.0 {
-            let total_secs = eta as u64;
-            let h = total_secs / 3600;
-            let m = (total_secs % 3600) / 60;
-            let s = total_secs % 60;
-            if h > 0 {
-                format!("{:02}:{:02}:{:02}", h, m, s)
-            } else {
-                format!("{:02}:{:02}", m, s)
-            }
-        } else {
-            "—".to_string()
-        }
-    } else {
-        "—".to_string()
-    }
-}
-
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
 
 /// Decode the bundled app icon to RGBA pixels (width, height, bytes).
@@ -586,7 +541,6 @@ fn format_eta_human(eta_opt: Option<f64>) -> String {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Icon {
     Plus,
-    Gear,
     Download,
     Check,
     Clock,
@@ -619,13 +573,6 @@ fn paint_icon(painter: &egui::Painter, center: Pos2, size: f32, icon: Icon, colo
         Icon::Plus => {
             painter.add(line(&[(0.0, -0.7), (0.0, 0.7)]));
             painter.add(line(&[(-0.7, 0.0), (0.7, 0.0)]));
-        }
-        Icon::Gear => {
-            painter.circle_stroke(center, 0.34 * size, st);
-            for i in 0..8 {
-                let a = (i as f32 * 45.0).to_radians();
-                painter.add(line(&[(0.72 * a.cos(), 0.72 * a.sin()), (0.95 * a.cos(), 0.95 * a.sin())]));
-            }
         }
         Icon::Download => {
             painter.add(line(&[(0.0, -0.85), (0.0, 0.3)]));
@@ -976,6 +923,15 @@ impl eframe::App for NativeApp {
                             {
                                 self.quitting = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            ui.add_space(6.0);
+                        } else if update.state == "update_available" {
+                            let label = format!("Update {} available", update.version.as_deref().unwrap_or(""));
+                            if icon_text_button(ui, Icon::Download, &label, Color32::WHITE, c.success, c.success.gamma_multiply(0.85), Stroke::NONE, 32.0)
+                                .on_hover_text("Open the download page for the new version")
+                                .clicked()
+                            {
+                                let _ = open::that(dm_core::updater::RELEASES_URL);
                             }
                             ui.add_space(6.0);
                         }

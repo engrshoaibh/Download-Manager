@@ -7,32 +7,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-release:
-    name: Build and Release
-    permissions:
-      contents: write
-    runs-on: windows-latest
-
+  # The tag must match the crate version: the in-app updater compares them.
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: core
-
-      # The tag must match the crate version: the in-app updater compares them.
+      - uses: actions/checkout@v4
       - name: Verify tag matches crate version
         if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         run: |
-          $crate = (Select-String -Path core/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $tag = "${{ github.ref_name }}".TrimStart('v')
-          if ($crate -ne $tag) { throw "Tag v$tag does not match core/Cargo.toml version $crate" }
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' core/Cargo.toml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then echo "Tag v$tag does not match core/Cargo.toml version $crate"; exit 1; fi
+
+  windows:
+    name: Windows installer
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
 
       - name: Run tests
         working-directory: core
@@ -51,18 +48,102 @@ jobs:
         shell: pwsh
         run: .\build_release.ps1
 
-      # Branch / manual runs: keep the assets as a run artifact (no release is created).
-      - name: Upload assets (non-tag runs)
-        if: "!startsWith(github.ref, 'refs/tags/')"
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: installer
-          path: release/*
+          name: windows
+          path: release/*.exe
           if-no-files-found: error
 
-      - name: Create Release and Upload Assets
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+  linux:
+    name: Linux tarball
+    needs: version
+    # The oldest supported runner, so the binaries run on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      # eframe/winit (X11 + Wayland), rfd file dialogs (GTK 3), and OpenSSL for reqwest.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-3-dev libssl-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Run tests
+        working-directory: core
+        run: cargo test --locked
+
+      - name: Build
+        working-directory: core
+        run: cargo build --release --locked --bin dm-gui --bin dm-daemon --bin dm-native-host
+
+      - name: Package
+        run: bash scripts/package_linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS disk image
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Run tests
+        working-directory: core
+        run: cargo test --locked
+
+      # Both architectures, joined into universal binaries by the packaging script.
+      - name: Build
+        working-directory: core
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --target "$t" --bin dm-gui --bin dm-daemon --bin dm-native-host
+          done
+
+      - name: Package
+        run: bash scripts/package_macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: release/*.dmg
+          if-no-files-found: error
+
+  # Tag pushes only: one release with every platform and a single checksum list
+  # (the Windows updater looks its installer up in SHA256SUMS.txt).
+  release:
+    name: Publish release
+    needs: [windows, linux, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: release
+        run: sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true

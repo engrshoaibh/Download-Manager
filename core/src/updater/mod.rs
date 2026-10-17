@@ -9,10 +9,12 @@ use tracing::{error, info};
 
 const GITHUB_REPO: &str = "engrshoaibh/Download-Manager";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Where macOS/Linux users get a new version (there is no in-place installer there).
+pub const RELEASES_URL: &str = "https://github.com/engrshoaibh/Download-Manager/releases/latest";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateStatus {
-    pub state: String, // "up_to_date", "checking", "downloading", "ready_to_restart", "error"
+    pub state: String, // "up_to_date", "checking", "downloading", "ready_to_restart", "update_available", "error"
     pub version: Option<String>,
     pub message: Option<String>,
 }
@@ -121,6 +123,15 @@ pub async fn check_and_apply_update() -> Result<bool> {
         set_status("up_to_date", Some(APP_VERSION.to_string()), Some("You are on the latest version".into()));
         return Ok(false);
     }
+    if !cfg!(windows) {
+        // macOS/Linux builds are archives, not installers: point the user at the release.
+        set_status(
+            "update_available",
+            Some(latest_version.clone()),
+            Some(format!("Version {latest_version} is available at {RELEASES_URL}")),
+        );
+        return Ok(false);
+    }
     if STAGED_INSTALLER.lock().is_some() {
         return Ok(true);
     }
@@ -210,7 +221,7 @@ pub fn spawn_auto_updater(interval: Duration) {
             if let Err(e) = check_and_apply_update().await {
                 error!("Auto-updater error: {}", e);
                 let current_state = get_status().state;
-                if current_state != "ready_to_restart" {
+                if current_state != "ready_to_restart" && current_state != "update_available" {
                     set_status("up_to_date", None, Some(format!("Check failed: {}", e)));
                 }
             }

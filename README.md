@@ -24,13 +24,22 @@ The desktop app is a native GPU-rendered window (egui), so there is no web view,
 | **YouTube** | Video, audio-only, quality selection, built-in DASH merge (ffmpeg fallback) |
 | **Browser capture** | Link and download interception, video banner, media grabber, HLS/DASH sniffing |
 | **Local API** | REST and WebSocket server on `127.0.0.1:7373` used by the extension |
-| **Self-update** | Checks GitHub releases and replaces the running executable |
+| **Self-update** | Windows: downloads, verifies and installs new releases. macOS/Linux: tells you when a new version is out |
 
 ## 📥 Installation
 
-1. Open the [Releases](https://github.com/engrshoaibh/Download-Manager/releases) page.
-2. Download `DownloadManagerPro-Setup-<version>.exe` and run it.
-3. Finish the wizard and launch **Download Manager Pro**.
+Download from the [Releases](https://github.com/engrshoaibh/Download-Manager/releases) page:
+
+| Platform | File |
+|---|---|
+| Windows 10/11 (x64) | `DownloadManagerPro-Setup-<version>.exe` |
+| macOS 11+ (Apple Silicon and Intel) | `DownloadManagerPro-<version>-macos-universal.dmg` |
+| Linux (x86_64) | `DownloadManagerPro-<version>-linux-x86_64.tar.gz` |
+
+### Windows
+
+1. Run `DownloadManagerPro-Setup-<version>.exe`.
+2. Finish the wizard and launch **Download Manager Pro**.
 
 The installer is a single file. It installs per user (no administrator prompt) to `%LOCALAPPDATA%\Programs\Download Manager Pro`, adds a Start menu entry (and optionally a desktop shortcut or start-with-Windows), and registers an uninstaller. Upgrades install over the top: run a newer installer, or click **Update - Restart** in the app when a new version has been downloaded. Updates are verified against the release's `SHA256SUMS.txt` before they run.
 
@@ -43,6 +52,26 @@ It installs `dm-gui.exe` (the desktop app, which also runs the download engine a
 3. The extension popup shows **App connected** when it can reach the app. Closing the window sends the app to the system tray, so downloads and the extension keep working; use **Quit** in the tray menu (or **File → Exit**) to stop it. If the app is not running when you start a download, the extension starts it in the tray through the native messaging host the installer registers (Chrome, Edge, Brave, Chromium). Start-with-Windows also starts it in the tray (`dm-gui.exe --background`).
 
 See [extension/README.md](extension/README.md) for details.
+
+### macOS
+
+1. Open the `.dmg` and drag **Download Manager Pro** to **Applications**.
+2. The app is not notarized, so the first launch needs confirmation: right-click the app, choose **Open**, then **Open** again.
+3. For the browser extension, copy the **Browser Extension** folder from the disk image somewhere permanent (for example `~/Applications`) and load it with **Load unpacked** as above.
+
+The app registers its native messaging host with Chrome, Edge, Brave, Chromium and Vivaldi each time it starts, so the extension can start it when it is closed.
+
+### Linux
+
+```bash
+tar -xzf DownloadManagerPro-<version>-linux-x86_64.tar.gz
+cd DownloadManagerPro-<version>-linux-x86_64
+./install.sh
+```
+
+`install.sh` installs to `~/.local/share/download-manager-pro` (no root), adds a menu entry and starts the app. Add `--autostart` to start it at login, or run `./install.sh --uninstall` to remove it. It needs GTK 3 (standard on desktop distributions). Load the browser extension from `~/.local/share/download-manager-pro/browser-extension`.
+
+On macOS and Linux there is no system tray yet: closing the window quits the app.
 
 ### YouTube tips
 
