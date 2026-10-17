@@ -19,10 +19,30 @@ const YT_DLP_RELEASE: &str =
 #[cfg(windows)]
 const FFMPEG_RELEASE_ZIP: &str =
     "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
-/// Deno for yt-dlp's YouTube signature/"n" challenges (single deno.exe in the zip root).
-#[cfg(windows)]
-const DENO_RELEASE_ZIP: &str =
-    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
+/// Official Deno release zip for this platform (a single `deno` binary in the zip root).
+fn deno_release_zip() -> Option<String> {
+    const BASE: &str = "https://github.com/denoland/deno/releases/latest/download/";
+    let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "deno-x86_64-pc-windows-msvc.zip",
+        ("linux", "x86_64") => "deno-x86_64-unknown-linux-gnu.zip",
+        ("linux", "aarch64") => "deno-aarch64-unknown-linux-gnu.zip",
+        ("macos", "x86_64") => "deno-x86_64-apple-darwin.zip",
+        ("macos", "aarch64") => "deno-aarch64-apple-darwin.zip",
+        _ => return None,
+    };
+    Some(format!("{BASE}{asset}"))
+}
+
+/// Standalone yt-dlp build for this platform (no Python needed).
+fn ytdlp_release_url() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", _) => YT_DLP_RELEASE,
+        ("macos", _) => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
+        ("linux", "aarch64") => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64",
+        _ => "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+    }
+}
+
 /// `/health` is polled by the UI, the extension and websites — remember the tool scan briefly.
 const HEALTH_CACHE_TTL: Duration = Duration::from_secs(30);
 /// True while a managed FFmpeg download is running (surfaced in `/health`).
@@ -765,11 +785,7 @@ async fn fetch_ytdlp() -> Result<PathBuf> {
     };
     let dest = dir.join(dest_name);
     let tmp = dir.join(format!("{dest_name}.partial"));
-    let url = if cfg!(windows) {
-        YT_DLP_RELEASE
-    } else {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-    };
+    let url = ytdlp_release_url();
 
     let client = reqwest::Client::builder()
         .user_agent("download-manager/0.1")
@@ -847,10 +863,30 @@ async fn fetch_ffmpeg() -> Result<PathBuf> {
     bail!("FFmpeg not found — install ffmpeg with your package manager")
 }
 
-/// Download a zip into the bin dir and unpack the given members with Windows' bsdtar
-/// (Windows 10+ ships it, so no extra dependency). Returns the unpack directory.
-#[cfg(windows)]
-async fn download_and_unpack(url: &str, name: &str, min_bytes: u64, members: &[&str]) -> Result<PathBuf> {
+/// Extract the entries of `zip_path` whose file name is in `names` (from any folder in
+/// the archive) directly into `out`, marked executable on Unix.
+fn unzip_named(zip_path: &Path, out: &Path, names: &[String]) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?).context("open zip")?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let file_name = entry.enclosed_name().and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
+        let Some(file_name) = file_name.filter(|f| names.contains(f)) else { continue };
+        let dest = out.join(&file_name);
+        let mut f = std::fs::File::create(&dest)?;
+        std::io::copy(&mut entry, &mut f)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(())
+}
+
+/// Download a zip into the bin dir and extract the entries whose file name is in `names`
+/// (wherever they sit in the archive) into a fresh unpack directory, which is returned.
+async fn download_and_unpack(url: &str, name: &str, min_bytes: u64, names: &[&str]) -> Result<PathBuf> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
@@ -892,64 +928,29 @@ async fn download_and_unpack(url: &str, name: &str, min_bytes: u64, members: &[&
         bail!("{name} download looks too small ({total} bytes)");
     }
 
-    std::fs::create_dir_all(&unpack).with_context(|| format!("create {name} unpack dir"))?;
-    let mut std_cmd = std::process::Command::new("tar");
-    std_cmd
-        .arg("-xf")
-        .arg(&zip)
-        .arg("-C")
-        .arg(&unpack)
-        .args(members)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    {
-        use std::os::windows::process::CommandExt;
-        std_cmd.creation_flags(0x08000000);
-    }
-    let mut cmd = Command::from(std_cmd);
-    cmd.kill_on_drop(true);
-    let unpacked = tokio::time::timeout(Duration::from_secs(300), cmd.status()).await;
+    let (zip_path, out, wanted) = (zip.clone(), unpack.clone(), names.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+    let extracted = tokio::task::spawn_blocking(move || unzip_named(&zip_path, &out, &wanted))
+        .await
+        .context("unzip task")?;
     let _ = std::fs::remove_file(&zip);
-    match unpacked {
-        Ok(Ok(_)) => Ok(unpack),
-        Ok(Err(e)) => {
-            let _ = std::fs::remove_dir_all(&unpack);
-            Err(e).with_context(|| format!("run tar to unpack {name}"))
-        }
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&unpack);
-            bail!("unpacking {name} timed out");
-        }
+    if let Err(e) = extracted {
+        let _ = std::fs::remove_dir_all(&unpack);
+        return Err(e).with_context(|| format!("unpack {name}"));
     }
+    Ok(unpack)
 }
 
 #[cfg(windows)]
 async fn fetch_ffmpeg() -> Result<PathBuf> {
     let dir = bin_dir();
     info!("FFmpeg not found — downloading a managed copy…");
-    let unpack = download_and_unpack(
-        FFMPEG_RELEASE_ZIP,
-        "ffmpeg",
-        20_000_000,
-        &["*/bin/ffmpeg.exe", "*/bin/ffprobe.exe"],
-    )
-    .await?;
-
-    // The archive has one top-level folder: <build-name>/bin/ffmpeg.exe
-    let mut found: Option<PathBuf> = None;
-    if let Ok(entries) = std::fs::read_dir(&unpack) {
-        for entry in entries.flatten() {
-            let bin = entry.path().join("bin");
-            if bin.join("ffmpeg.exe").is_file() {
-                found = Some(bin);
-                break;
-            }
-        }
-    }
-    let Some(bin) = found else {
-        let _ = std::fs::remove_dir_all(&unpack);
+    // The archive keeps them under <build-name>/bin/; extraction flattens that.
+    let bin = download_and_unpack(FFMPEG_RELEASE_ZIP, "ffmpeg", 20_000_000, &["ffmpeg.exe", "ffprobe.exe"]).await?;
+    if !bin.join("ffmpeg.exe").is_file() {
+        let _ = std::fs::remove_dir_all(&bin);
         bail!("ffmpeg.exe was not found in the downloaded archive");
-    };
+    }
+    let unpack = bin.clone();
 
     let dest = dir.join("ffmpeg.exe");
     for name in ["ffmpeg.exe", "ffprobe.exe"] {
@@ -1276,22 +1277,20 @@ async fn ensure_js_runtime() {
     }
 }
 
-#[cfg(not(windows))]
 async fn fetch_deno() -> Result<PathBuf> {
-    bail!("no JavaScript runtime — install Deno with your package manager")
-}
-
-#[cfg(windows)]
-async fn fetch_deno() -> Result<PathBuf> {
+    let Some(url) = deno_release_zip() else {
+        bail!("no JavaScript runtime — install Deno with your package manager");
+    };
     info!("No JavaScript runtime found — downloading a managed Deno…");
-    let unpack = download_and_unpack(DENO_RELEASE_ZIP, "deno", 10_000_000, &["deno.exe"]).await?;
-    let from = unpack.join("deno.exe");
+    let exe = if cfg!(windows) { "deno.exe" } else { "deno" };
+    let unpack = download_and_unpack(&url, "deno", 10_000_000, &[exe]).await?;
+    let from = unpack.join(exe);
     let dest = managed_deno();
     let moved = if from.is_file() {
         let _ = std::fs::remove_file(&dest);
-        std::fs::rename(&from, &dest).context("install deno.exe")
+        std::fs::rename(&from, &dest).context("install deno")
     } else {
-        Err(anyhow::anyhow!("deno.exe was not found in the downloaded archive"))
+        Err(anyhow::anyhow!("{exe} was not found in the downloaded archive"))
     };
     let _ = std::fs::remove_dir_all(&unpack);
     moved?;
@@ -2658,6 +2657,29 @@ mod cookie_tests {
 #[cfg(test)]
 mod same_container_tests {
     use super::*;
+
+    #[test]
+    fn unzip_takes_named_files_from_any_folder() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("dm-unzip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("t.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            w.start_file("ffmpeg-build/bin/ffmpeg.exe", opts).unwrap();
+            w.write_all(b"binary").unwrap();
+            w.start_file("ffmpeg-build/README.txt", opts).unwrap();
+            w.write_all(b"skip me").unwrap();
+            w.finish().unwrap();
+        }
+        let out = dir.join("out");
+        unzip_named(&zip_path, &out, &["ffmpeg.exe".into(), "ffprobe.exe".into()]).unwrap();
+        assert_eq!(std::fs::read(out.join("ffmpeg.exe")).unwrap(), b"binary");
+        assert!(!out.join("README.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pairs_stay_in_one_container() {

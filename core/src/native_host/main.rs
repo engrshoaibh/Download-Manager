@@ -239,6 +239,12 @@ fn spawn_detached(gui: &std::path::Path) -> io::Result<()> {
         // The browser's job may forbid breakaway; fall back to a plain detached start.
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
+    // Own process group, so the browser killing the host's group leaves the app running.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.spawn().map(|_| ())
 }
 

@@ -16,6 +16,14 @@ async fn main() -> Result<()> {
 
     updater::cleanup_bak();
 
+    // macOS/Linux: let the browser extension find and start us (Windows: installer registry).
+    #[cfg(unix)]
+    match dm_core::native_messaging::register_for_current_exe() {
+        Ok(n) if n > 0 => info!("Native messaging host registered for {n} browser(s)"),
+        Ok(_) => {}
+        Err(e) => warn!("Could not register the native messaging host: {e}"),
+    }
+
     let tools = youtube::verify_tools_at_startup().await;
     match tools.status.as_str() {
         "ok" => info!(

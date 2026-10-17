@@ -925,6 +925,15 @@ impl eframe::App for NativeApp {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                             ui.add_space(6.0);
+                        } else if update.state == "update_available" {
+                            let label = format!("Update {} available", update.version.as_deref().unwrap_or(""));
+                            if icon_text_button(ui, Icon::Download, &label, Color32::WHITE, c.success, c.success.gamma_multiply(0.85), Stroke::NONE, 32.0)
+                                .on_hover_text("Open the download page for the new version")
+                                .clicked()
+                            {
+                                let _ = open::that(dm_core::updater::RELEASES_URL);
+                            }
+                            ui.add_space(6.0);
                         }
                         let theme_icon = if self.theme == ThemeMode::Light { Icon::Moon } else { Icon::Sun };
                         if icon_button(ui, &c, theme_icon, "Toggle light/dark theme").clicked() {

@@ -51,6 +51,14 @@ fn main() -> eframe::Result<()> {
     let _enter = rt.enter();
 
     updater::cleanup_bak();
+
+    // macOS/Linux: let the browser extension find and start us (Windows: installer registry).
+    #[cfg(unix)]
+    match dm_core::native_messaging::register_for_current_exe() {
+        Ok(n) if n > 0 => eprintln!("Native messaging host registered for {n} browser(s)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("Could not register the native messaging host: {e}"),
+    }
     // Updates wait for the user to click "Restart" instead of closing the app mid-download.
     updater::require_user_confirmation();
 

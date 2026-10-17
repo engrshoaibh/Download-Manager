@@ -2,6 +2,7 @@ pub mod api;
 pub mod engine;
 pub mod io;
 pub mod mux;
+pub mod native_messaging;
 pub mod network;
 pub mod persist;
 pub mod settings;
