@@ -35,21 +35,56 @@ foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
     if ($ascii -match '(?i)vcruntime140\.dll') { throw "$bin still depends on VCRUNTIME140.dll (crt-static not applied)" }
 }
 
-Write-Host 'Fetching yt-dlp for the installer...'
-# Shipped so YouTube works right after install; the app's updater keeps it current afterwards.
+# YouTube tools shipped so downloads work right after install (the app otherwise fetches
+# them on first use). Each download is checked against its project's published SHA-256.
 $VendorDir = Join-Path $Root 'installer\vendor'
-New-Item -ItemType Directory -Path $VendorDir -Force | Out-Null
-$YtDlp = Join-Path $VendorDir 'yt-dlp.exe'
-$YtBase = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
+if (Test-Path $VendorDir) { Remove-Item $VendorDir -Recurse -Force }
+New-Item -ItemType Directory -Path $VendorDir | Out-Null
 $ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest -Uri "$YtBase/yt-dlp.exe" -OutFile $YtDlp -UseBasicParsing
-$sums = (Invoke-WebRequest -Uri "$YtBase/SHA2-256SUMS" -UseBasicParsing).Content
-if ($sums -is [byte[]]) { $sums = [System.Text.Encoding]::ASCII.GetString($sums) }
-$expected = ($sums -split "`n" | Where-Object { $_ -match '\syt-dlp\.exe\s*$' } | Select-Object -First 1) -replace '\s.*$', ''
-if (-not $expected) { throw 'yt-dlp.exe checksum not found in SHA2-256SUMS' }
-$actual = (Get-FileHash $YtDlp -Algorithm SHA256).Hash
-if ($actual -ne $expected.Trim().ToUpper()) { throw "yt-dlp.exe checksum mismatch (expected $expected, got $actual)" }
-Write-Host "yt-dlp.exe verified ($((Get-Item $YtDlp).Length) bytes)"
+
+function Get-VerifiedFile([string]$Url, [string]$OutFile, [string]$SumsUrl, [string]$Name) {
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+    $sums = (Invoke-WebRequest -Uri $SumsUrl -UseBasicParsing).Content
+    if ($sums -is [byte[]]) { $sums = [System.Text.Encoding]::ASCII.GetString($sums) }
+    $lines = @($sums -split "`r?`n" | Where-Object { $_ -match '[0-9a-fA-F]{64}' })
+    $line = $lines | Where-Object { $_ -match "(^|[\s*/\\])$([regex]::Escape($Name))\s*$" } | Select-Object -First 1
+    if (-not $line -and $lines.Count -eq 1) { $line = $lines[0] }  # single-file checksum
+    if (-not $line) { throw "Checksum for $Name not found at $SumsUrl" }
+    $expected = ([regex]::Match($line, '[0-9a-fA-F]{64}')).Value.ToUpper()
+    $actual = (Get-FileHash $OutFile -Algorithm SHA256).Hash
+    if ($actual -ne $expected) { throw "$Name checksum mismatch (expected $expected, got $actual)" }
+    Write-Host "$Name verified ($((Get-Item $OutFile).Length) bytes)"
+}
+
+Write-Host 'Fetching yt-dlp...'
+$YtBase = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
+Get-VerifiedFile "$YtBase/yt-dlp.exe" (Join-Path $VendorDir 'yt-dlp.exe') "$YtBase/SHA2-256SUMS" 'yt-dlp.exe'
+
+Write-Host 'Fetching FFmpeg...'
+$FfBase = 'https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download'
+$FfName = 'ffmpeg-master-latest-win64-gpl.zip'
+$FfZip = Join-Path $env:TEMP $FfName
+Get-VerifiedFile "$FfBase/$FfName" $FfZip "$FfBase/checksums.sha256" $FfName
+$FfOut = Join-Path $env:TEMP 'dm-ffmpeg'
+if (Test-Path $FfOut) { Remove-Item $FfOut -Recurse -Force }
+Expand-Archive $FfZip -DestinationPath $FfOut
+$FfBin = Get-ChildItem $FfOut -Recurse -Filter 'ffmpeg.exe' | Where-Object { $_.Directory.Name -eq 'bin' } | Select-Object -First 1
+if (-not $FfBin) { throw 'ffmpeg.exe not found in FFmpeg archive' }
+Copy-Item (Join-Path $FfBin.DirectoryName 'ffmpeg.exe') $VendorDir
+Copy-Item (Join-Path $FfBin.DirectoryName 'ffprobe.exe') $VendorDir
+# GPL build: ship its licence alongside the binaries.
+$FfLicense = Get-ChildItem $FfOut -Recurse -Filter 'LICENSE*' | Select-Object -First 1
+if ($FfLicense) { Copy-Item $FfLicense.FullName (Join-Path $VendorDir 'FFmpeg-LICENSE.txt') }
+Remove-Item $FfZip, $FfOut -Recurse -Force
+
+Write-Host 'Fetching Deno...'
+$DenoBase = 'https://github.com/denoland/deno/releases/latest/download'
+$DenoName = 'deno-x86_64-pc-windows-msvc.zip'
+$DenoZip = Join-Path $env:TEMP $DenoName
+Get-VerifiedFile "$DenoBase/$DenoName" $DenoZip "$DenoBase/$DenoName.sha256sum" $DenoName
+Expand-Archive $DenoZip -DestinationPath $VendorDir -Force
+Remove-Item $DenoZip -Force
+if (-not (Test-Path (Join-Path $VendorDir 'deno.exe'))) { throw 'deno.exe not found in Deno archive' }
 
 Write-Host 'Locating Inno Setup...'
 $Iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
