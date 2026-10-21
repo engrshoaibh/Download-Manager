@@ -58,7 +58,16 @@ function Get-VerifiedFile([string]$Url, [string]$OutFile, [string]$SumsUrl, [str
 
 Write-Host 'Fetching yt-dlp...'
 $YtBase = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
-Get-VerifiedFile "$YtBase/yt-dlp.exe" (Join-Path $VendorDir 'yt-dlp.exe') "$YtBase/SHA2-256SUMS" 'yt-dlp.exe'
+# Folder build: runs as one process without unpacking Python to %TEMP% on every launch.
+$YtZip = Join-Path $env:TEMP 'yt-dlp_win.zip'
+Get-VerifiedFile "$YtBase/yt-dlp_win.zip" $YtZip "$YtBase/SHA2-256SUMS" 'yt-dlp_win.zip'
+$YtOut = Join-Path $env:TEMP 'dm-yt-dlp'
+if (Test-Path $YtOut) { Remove-Item $YtOut -Recurse -Force }
+Expand-Archive $YtZip -DestinationPath $YtOut
+$YtExe = Get-ChildItem $YtOut -Recurse -Filter 'yt-dlp.exe' | Select-Object -First 1
+if (-not $YtExe) { throw 'yt-dlp.exe not found in yt-dlp_win.zip' }
+Copy-Item $YtExe.DirectoryName (Join-Path $VendorDir 'yt-dlp_win') -Recurse
+Remove-Item $YtZip, $YtOut -Recurse -Force
 
 Write-Host 'Fetching FFmpeg...'
 $FfBase = 'https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download'

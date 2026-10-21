@@ -109,24 +109,28 @@ export function resolveCaptureTarget(url, pageUrl = '', qualityHint = '') {
     const itag = Number(u.searchParams.get('itag') || 0);
     const meta = YT_ITAG[itag];
     out.pinnedItag = itag;
-    if (!itag || !meta) return out;
+    if (!itag) return out;
 
-    if (meta.audio) {
-      out.audioOnly = true;
-      out.quality = 'audio';
-      /* audio-only CDN can download via segmented HTTP */
-      return out;
-    }
-
-    if (meta.progressive) {
-      /* muxed A+V — keep CDN URL for fast multi-segment HTTP */
-      const m = String(meta.label || '').match(/(\d{3,4})/);
-      if (m) out.quality = m[1];
-      return out;
-    }
-
+    /* YouTube binds CDN URLs to the player session, so the app can't fetch them
+       directly. With a watch page, let yt-dlp re-resolve the same itag. */
     const watch = normalizeYouTubeWatchUrl(pageUrl);
     if (!watch) return out;
+
+    if (meta?.audio) {
+      out.url = watch;
+      out.audioOnly = true;
+      out.quality = 'audio';
+      out.format = `${itag}/ba`;
+      return out;
+    }
+
+    if (!meta || meta.progressive) {
+      out.url = watch;
+      out.format = `${itag}/bv*+ba/b`;
+      const m = String(meta?.label || qualityHint || '').match(/(\d{3,4})/);
+      out.quality = m ? m[1] : qualityHint || undefined;
+      return out;
+    }
 
     /* Adaptive video-only — pin exact itag (e.g. 313 = 4K webm) + best audio */
     out.url = watch;

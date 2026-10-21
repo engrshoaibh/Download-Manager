@@ -1,6 +1,6 @@
 [package]
 name = "dm-core"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "High-Performance Download Manager Pro Core Engine"
 

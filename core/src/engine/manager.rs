@@ -165,7 +165,24 @@ impl DownloadManager {
             .unwrap_or(DEFAULT_SEGMENT_COUNT)
             .min(MAX_SEGMENT_COUNT);
 
-        let is_direct_cdn = crate::network::client::is_googlevideo_media_url(&url);
+        let mut is_direct_cdn = crate::network::client::is_googlevideo_media_url(&url);
+        // YouTube CDN links are tied to the browser's player session (PO token / SABR) and
+        // return nothing when fetched directly; let yt-dlp resolve the same itag instead.
+        let mut format = format;
+        let mut quality = quality;
+        if is_direct_cdn
+            && referer
+                .as_deref()
+                .is_some_and(crate::youtube::is_youtube_page_url)
+        {
+            if format.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                format = crate::youtube::cdn_itag_selector(&url);
+            }
+            if format.is_none() && quality.is_none() {
+                quality = Some("best".into());
+            }
+            is_direct_cdn = false;
+        }
         let is_hls = crate::youtube::is_stream_manifest_url(&url);
         let force_yt = !is_direct_cdn
             && (quality

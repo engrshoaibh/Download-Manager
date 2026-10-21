@@ -60,8 +60,8 @@ Source: "{#SourceDir}\installer\com.dmpro.native_host.json"; DestDir: "{app}"; F
 Source: "{#SourceDir}\extension\*"; DestDir: "{app}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 ; YouTube tools go into the app's managed tools folder (where it would otherwise download them).
-; Keep an existing yt-dlp: the in-app updater keeps it at least as new as the bundled one.
-Source: "{#SourceDir}\installer\vendor\yt-dlp.exe"; DestDir: "{localappdata}\download-manager\bin"; Flags: onlyifdoesntexist
+; yt-dlp folder build (single process); the in-app updater replaces it with newer releases.
+Source: "{#SourceDir}\installer\vendor\yt-dlp_win\*"; DestDir: "{localappdata}\download-manager\bin\yt-dlp_win"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\installer\vendor\ffmpeg.exe"; DestDir: "{localappdata}\download-manager\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\installer\vendor\ffprobe.exe"; DestDir: "{localappdata}\download-manager\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\installer\vendor\FFmpeg-LICENSE.txt"; DestDir: "{localappdata}\download-manager\bin"; Flags: ignoreversion skipifsourcedoesntexist
@@ -85,6 +85,10 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 ; In-app update: the app quit for the silent install, so start the new version.
 ; (RestartApplications only restarts apps registered with Restart Manager, which this one isn't.)
 Filename: "{app}\{#AppExe}"; Flags: nowait; Check: IsAppUpdate
+
+[InstallDelete]
+; Superseded by the yt-dlp_win folder build.
+Type: files; Name: "{localappdata}\download-manager\bin\yt-dlp.exe"
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.bak"

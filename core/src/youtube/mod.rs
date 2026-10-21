@@ -13,8 +13,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-const YT_DLP_RELEASE: &str =
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+/// Folder ("onedir") build: one process, no Python unpacked to %TEMP% on every launch,
+/// unlike the single-file yt-dlp.exe (which shows as two processes and burns CPU at start).
+#[cfg(windows)]
+const YT_DLP_WIN_ZIP: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_win.zip";
+#[cfg(windows)]
+const YT_DLP_ONEDIR: &str = "yt-dlp_win";
 /// Static FFmpeg build recommended by yt-dlp (contains bin/ffmpeg.exe + ffprobe.exe).
 #[cfg(windows)]
 const FFMPEG_RELEASE_ZIP: &str =
@@ -67,6 +72,11 @@ fn store_info_json(target: &str, json: Vec<u8>) {
 fn forget_info_json(target: &str) {
     INFO_JSON_CACHE.lock().remove(target);
 }
+
+/// CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS: no console, and yt-dlp (plus the FFmpeg
+/// it starts, which inherits the class) never competes with the foreground app for CPU.
+#[cfg(windows)]
+const YTDLP_SPAWN_FLAGS: u32 = 0x0800_0000 | 0x0000_4000;
 
 /// Machine-readable progress line emitted by yt-dlp (`--progress-template`).
 const DM_PROG_PREFIX: &str = "[DMPROG]";
@@ -221,6 +231,28 @@ pub fn normalize_watch_url(url: &str) -> String {
     }
 
     url.to_string()
+}
+
+/// yt-dlp `-f` for the exact stream a googlevideo URL points at (its `itag`), plus audio
+/// for video-only streams. YouTube binds CDN URLs to the player session, so the app can't
+/// fetch them directly; yt-dlp re-resolves the same format from the watch page.
+pub fn cdn_itag_selector(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let mut itag = None;
+    let mut mime = String::new();
+    for (k, v) in u.query_pairs() {
+        match k.as_ref() {
+            "itag" => itag = v.parse::<u32>().ok(),
+            "mime" => mime = v.to_ascii_lowercase(),
+            _ => {}
+        }
+    }
+    let itag = itag?;
+    Some(if mime.starts_with("audio") {
+        format!("{itag}/ba/b")
+    } else {
+        format!("{itag}+ba/{itag}/bv*+ba/b")
+    })
 }
 
 pub fn format_selector(opts: &YoutubeOptions) -> String {
@@ -692,6 +724,13 @@ fn bin_dir() -> PathBuf {
 /// The managed copy wins over PATH: it is the one the daily updater refreshes, and a stale
 /// yt-dlp stops working when YouTube changes. A PATH copy is used only until the first update.
 fn find_ytdlp() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let onedir = bin_dir().join(YT_DLP_ONEDIR).join("yt-dlp.exe");
+        if onedir.is_file() {
+            return Some(onedir);
+        }
+    }
     let names = ["yt-dlp.exe", "yt-dlp", "ytdlp.exe"];
     let bundled = bin_dir().join(if cfg!(windows) {
         "yt-dlp.exe"
@@ -797,21 +836,57 @@ fn which(name: &str) -> Result<PathBuf> {
     }
 }
 
+#[cfg(windows)]
+async fn fetch_ytdlp() -> Result<PathBuf> {
+    let unpack = download_and_unpack(YT_DLP_WIN_ZIP, "yt-dlp", 5_000_000, &[]).await?;
+    let result = install_ytdlp_onedir(&unpack);
+    let _ = std::fs::remove_dir_all(&unpack);
+    let dest = result?;
+    // The single-file copy is no longer used once the folder build is in place.
+    let _ = std::fs::remove_file(bin_dir().join("yt-dlp.exe"));
+    VERIFIED_TOOLS.lock().clear();
+    invalidate_tools_health();
+    info!("Installed yt-dlp → {}", dest.display());
+    Ok(dest)
+}
+
+/// Swap a freshly unpacked yt-dlp folder build into `bin/yt-dlp_win`.
+#[cfg(windows)]
+fn install_ytdlp_onedir(unpack: &Path) -> Result<PathBuf> {
+    // The zip holds yt-dlp.exe + _internal\ either at its root or inside one folder.
+    let src = if unpack.join("yt-dlp.exe").is_file() {
+        unpack.to_path_buf()
+    } else {
+        std::fs::read_dir(unpack)?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.join("yt-dlp.exe").is_file())
+            .context("yt-dlp.exe not found in yt-dlp_win.zip")?
+    };
+    let dir = bin_dir();
+    let dest = dir.join(YT_DLP_ONEDIR);
+    let old = dir.join(format!("{YT_DLP_ONEDIR}.old"));
+    let _ = std::fs::remove_dir_all(&old);
+    if dest.exists() {
+        // Fails while a download is running yt-dlp; the next scheduled update retries.
+        std::fs::rename(&dest, &old).context("replace yt-dlp (in use?)")?;
+    }
+    if let Err(e) = std::fs::rename(&src, &dest) {
+        let _ = std::fs::rename(&old, &dest);
+        return Err(e).context("install yt-dlp folder");
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    Ok(dest.join("yt-dlp.exe"))
+}
+
+#[cfg(not(windows))]
 async fn fetch_ytdlp() -> Result<PathBuf> {
     let dir = bin_dir();
     std::fs::create_dir_all(&dir).context("create bin dir")?;
-    let dest_name = if cfg!(windows) {
-        "yt-dlp.exe"
-    } else {
-        "yt-dlp"
-    };
+    let dest_name = "yt-dlp";
     let dest = dir.join(dest_name);
     let tmp = dir.join(format!("{dest_name}.partial"));
-    let url = if cfg!(windows) {
-        YT_DLP_RELEASE
-    } else {
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
-    };
+    let url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
 
     let client = reqwest::Client::builder()
         .user_agent("download-manager/0.1")
@@ -1158,7 +1233,7 @@ pub async fn probe_cancellable(
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            std_cmd.creation_flags(0x08000000);
+            std_cmd.creation_flags(YTDLP_SPAWN_FLAGS);
         }
         
         let mut cmd = Command::from(std_cmd);
@@ -1644,7 +1719,7 @@ async fn assert_selected_height(
     apply_account_auth(&mut cmd);
 
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
+    cmd.creation_flags(YTDLP_SPAWN_FLAGS);
     let output = cmd.output().await.context("yt-dlp format preflight")?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -1873,9 +1948,10 @@ async fn download_once(
         /* Native HLS fragment workers. 32 saturates a typical link without a second merge pass. */
         opts.concurrent_fragments.unwrap_or(32).clamp(8, 32)
     } else {
+        /* YouTube DASH formats are single files: more workers only add Python CPU load. */
         opts.concurrent_fragments
             .unwrap_or(DEFAULT_CONCURRENT_FRAGMENTS)
-            .clamp(1, 16)
+            .clamp(1, 8)
     };
 
     // Fail closed for YouTube only — HLS manifests often report height=0/NA.
@@ -2005,7 +2081,7 @@ async fn download_once(
 
     // The app is a GUI process: without this Windows opens a console for yt-dlp.
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
+    cmd.creation_flags(YTDLP_SPAWN_FLAGS);
 
     let mut child = cmd.spawn().context("spawn yt-dlp")?;
     let child_pid = child.id().unwrap_or(0);
@@ -2052,7 +2128,8 @@ async fn download_once(
     let mut last_part_bytes: u64 = 0;
     let mut last_part_instant = std::time::Instant::now();
     let mut poll_ticks: u64 = 0;
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    // stdout DMPROG lines carry live progress; the work-dir scan is only a fallback.
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let status = loop {
@@ -2598,6 +2675,15 @@ fn parse_size_token(token: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdn_itag_selector_pins_stream() {
+        let video = "https://rr2---sn-q4f.googlevideo.com/videoplayback?expire=1&itag=137&mime=video%2Fmp4&clen=407699258";
+        assert_eq!(cdn_itag_selector(video).as_deref(), Some("137+ba/137/bv*+ba/b"));
+        let audio = "https://rr2---sn-q4f.googlevideo.com/videoplayback?itag=140&mime=audio%2Fmp4";
+        assert_eq!(cdn_itag_selector(audio).as_deref(), Some("140/ba/b"));
+        assert_eq!(cdn_itag_selector("https://rr2.googlevideo.com/videoplayback?mime=video%2Fmp4"), None);
+    }
 
     #[test]
     fn selector_prefers_adaptive_not_mp4_only() {
