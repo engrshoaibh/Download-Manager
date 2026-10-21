@@ -45,6 +45,12 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === 'sync' && changes.settings) {
         settings = { ...settings, ...changes.settings.newValue };
+        if (settings?.enabled === false) {
+          removeAllBanners();
+          if (isTop) removeMediaPanel();
+          closeOpenMenu();
+          return;
+        }
         if (isTop && settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
         else if (isTop) removeMediaPanel();
         if (settings?.videoBanner !== false) scheduleBanners();
@@ -82,12 +88,15 @@
       }
     });
 
+    if (settings?.enabled === false) return;
+
     /* Media grabber is noisy on YouTube (CDN flood); banner handles downloads there */
     if (isTop && settings?.mediaGrabber !== false && !isYouTubeHere()) scheduleMediaSniff();
     if (settings?.videoBanner !== false) scheduleBanners();
     if (isTop) prefetchYoutubeIfNeeded();
 
     const mo = new MutationObserver((mutations) => {
+      if (settings?.enabled === false) return;
       if (openMenu) return;
       if (isOurUiMutation(mutations)) return;
       if (isTop && settings?.mediaGrabber && !isYouTubeHere()) scheduleMediaSniff();
@@ -96,7 +105,6 @@
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
     watchNetworkResources();
-    injectPlayerHooks();
 
     /* YouTube SPA navigations */
     if (isTop) {
@@ -151,69 +159,12 @@
     });
   }
 
-  /** Page-world hooks for hls.js / fetch of manifests (blob players). */
-  function injectPlayerHooks() {
-    try {
-      const s = document.createElement('script');
-      s.textContent = `(() => {
-        if (window.__dmPlayerHooked) return;
-        window.__dmPlayerHooked = true;
-        const post = (url) => {
-          try {
-            if (!url || typeof url !== 'string') return;
-            if (!/^https?:/i.test(url)) return;
-            window.postMessage({ source: 'dm-player-hook', url }, '*');
-          } catch (_) {}
-        };
-        const looksMedia = (u) =>
-          /\\.(m3u8|mpd|mp4|m4v|webm)(\\?|$)/i.test(u) ||
-          /[?&](m3u8|mpd|playlist|hls)/i.test(u) ||
-          /\\/(hls|dash|playlist|master|manifest|stream|litro)\\b/i.test(u) ||
-          /master\\.m3u8|index\\.m3u8/i.test(u);
-
-        const origFetch = window.fetch;
-        if (typeof origFetch === 'function') {
-          window.fetch = function (...args) {
-            try {
-              const u = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-              if (u && looksMedia(u)) post(u);
-            } catch (_) {}
-            return origFetch.apply(this, args);
-          };
-        }
-
-        const XO = window.XMLHttpRequest;
-        if (XO && XO.prototype) {
-          const open = XO.prototype.open;
-          XO.prototype.open = function (method, url, ...rest) {
-            try {
-              if (url && looksMedia(String(url))) post(String(url));
-            } catch (_) {}
-            return open.call(this, method, url, ...rest);
-          };
-        }
-
-        const wrapHls = () => {
-          const H = window.Hls;
-          if (!H || H.__dmWrapped) return;
-          H.__dmWrapped = true;
-          const load = H.prototype.loadSource;
-          if (typeof load === 'function') {
-            H.prototype.loadSource = function (src) {
-              post(src);
-              return load.call(this, src);
-            };
-          }
-        };
-        wrapHls();
-        setInterval(wrapHls, 1500);
-      })();`;
-      (document.documentElement || document.head).appendChild(s);
-      s.remove();
-    } catch {
-      /* CSP may block — webRequest + PerformanceObserver still help */
-    }
-  }
+  /*
+   * Page-world hooks for hls.js / fetch of manifests (blob players) are
+   * loaded declaratively via manifest.json ("world": "MAIN", content/player-hooks.js)
+   * instead of being injected here as an inline <script>, which used to trip
+   * page CSPs and show up as a blocked-script error in chrome://extensions.
+   */
 
   function isYouTubeHere() {
     return /(?:^|\.)youtube\.com$|(?:^|\.)youtu\.be$/i.test(location.hostname);
@@ -1281,7 +1232,7 @@
   }
 
   function sniffMedia() {
-    if (!settings?.mediaGrabber) return;
+    if (!settings?.enabled || !settings?.mediaGrabber) return;
     if (isYouTubeHere()) return; /* banner + CDN sniff handle YouTube */
 
     const urls = new Set();

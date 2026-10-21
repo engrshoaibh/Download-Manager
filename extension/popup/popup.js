@@ -16,7 +16,34 @@ const els = {
   daemonText: document.getElementById('daemonText'),
   save: document.getElementById('save'),
   saved: document.getElementById('saved'),
+  features: document.getElementById('features'),
+  offNotice: document.getElementById('offNotice'),
 };
+
+/** Sub-settings that only make sense while master capture is on. */
+const dependentFields = [
+  els.captureMode,
+  els.interceptBrowserDownloads,
+  els.linkClickCapture,
+  els.altSkipsCapture,
+  els.insertForcesCapture,
+  els.catchVideoPageLinks,
+  els.videoBanner,
+  els.mediaGrabber,
+  els.segments,
+  els.extensions,
+];
+
+function applyMasterState() {
+  const on = els.enabled.checked;
+  els.features.classList.toggle('is-disabled', !on);
+  els.offNotice.hidden = on;
+  for (const field of dependentFields) {
+    field.disabled = !on;
+  }
+}
+
+els.enabled.addEventListener('change', applyMasterState);
 
 async function refreshDaemon() {
   const res = await chrome.runtime.sendMessage({ type: 'CHECK_DAEMON' });
@@ -42,6 +69,7 @@ async function hydrate() {
   els.insertForcesCapture.checked = s.insertForcesCapture !== false;
   els.segments.value = String(s.segments || 16);
   els.extensions.value = (s.extensions || DEFAULT_SETTINGS.extensions).join(', ');
+  applyMasterState();
   await refreshDaemon();
 }
 

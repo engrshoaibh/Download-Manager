@@ -144,7 +144,14 @@
   padding: 4px;
   max-height: 420px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
+
+.dm-res-list::-webkit-scrollbar { width: 6px; }
+.dm-res-list::-webkit-scrollbar-track { background: transparent; }
+.dm-res-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.25); border-radius: 999px; }
+.dm-res-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
 
 .dm-res-item {
   width: 100%;
@@ -245,7 +252,14 @@
   margin: 0;
   padding: 6px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
 }
+
+#dm-media-grabber .dm-mg-list::-webkit-scrollbar { width: 6px; }
+#dm-media-grabber .dm-mg-list::-webkit-scrollbar-track { background: transparent; }
+#dm-media-grabber .dm-mg-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.25); border-radius: 999px; }
+#dm-media-grabber .dm-mg-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
 
 #dm-media-grabber .dm-mg-list li {
   display: flex;
