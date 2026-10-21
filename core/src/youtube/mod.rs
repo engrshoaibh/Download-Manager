@@ -34,6 +34,38 @@ lazy_static::lazy_static! {
     /// One FFmpeg download at a time, however many stream jobs start together.
     static ref FFMPEG_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
     static ref DENO_FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+    /// Raw `yt-dlp -J` output per target URL. A YouTube extraction (player JS + challenge
+    /// solving) takes tens of seconds; reusing it via `--load-info-json` avoids repeating it.
+    static ref INFO_JSON_CACHE: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, Arc<Vec<u8>>)>> =
+        parking_lot::Mutex::new(std::collections::HashMap::new());
+    /// Binaries that already passed `verify_executable` this process.
+    static ref VERIFIED_TOOLS: parking_lot::Mutex<std::collections::HashSet<PathBuf>> =
+        parking_lot::Mutex::new(std::collections::HashSet::new());
+}
+
+/// Signed googlevideo URLs inside the info JSON stay valid for hours; stay well inside that.
+const INFO_JSON_TTL: Duration = Duration::from_secs(20 * 60);
+const INFO_JSON_CACHE_MAX: usize = 16;
+
+fn cached_info_json(target: &str) -> Option<Arc<Vec<u8>>> {
+    let mut cache = INFO_JSON_CACHE.lock();
+    cache.retain(|_, (at, _)| at.elapsed() < INFO_JSON_TTL);
+    cache.get(target).map(|(_, json)| Arc::clone(json))
+}
+
+fn store_info_json(target: &str, json: Vec<u8>) {
+    let mut cache = INFO_JSON_CACHE.lock();
+    cache.retain(|_, (at, _)| at.elapsed() < INFO_JSON_TTL);
+    if cache.len() >= INFO_JSON_CACHE_MAX {
+        if let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(target.to_string(), (std::time::Instant::now(), Arc::new(json)));
+}
+
+fn forget_info_json(target: &str) {
+    INFO_JSON_CACHE.lock().remove(target);
 }
 
 /// Machine-readable progress line emitted by yt-dlp (`--progress-template`).
@@ -483,8 +515,18 @@ pub async fn verify_tools_at_startup() -> ToolsHealth {
 
 async fn verify_executable(path: &Path, label: &str) -> Result<()> {
     if !path.is_file() {
+        VERIFIED_TOOLS.lock().remove(path);
         bail!("{label} binary missing at {}", path.display());
     }
+    if VERIFIED_TOOLS.lock().contains(path) {
+        return Ok(());
+    }
+    verify_executable_uncached(path, label).await?;
+    VERIFIED_TOOLS.lock().insert(path.to_path_buf());
+    Ok(())
+}
+
+async fn verify_executable_uncached(path: &Path, label: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1077,6 +1119,13 @@ pub async fn probe_cancellable(
     let target = resolve_youtube_target(url, opts.referer.as_deref())
         .unwrap_or_else(|| url.to_string());
 
+    if let Some(json) = cached_info_json(&target) {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&json) {
+            info!("yt-dlp probe: reusing cached extraction for {target}");
+            return parse_info(value, &target);
+        }
+    }
+
     // Prefer cookie-less first — extension Cookie headers commonly trigger
     // "The page needs to be reloaded". Fall back to cookies for age-gated media.
     // A real cookie jar from the browser avoids the bot check, so use it from the start.
@@ -1190,7 +1239,9 @@ pub async fn probe_cancellable(
         if output.status.success() {
             let json: serde_json::Value =
                 serde_json::from_slice(&output.stdout).context("parse yt-dlp JSON")?;
-            return parse_info(json, &target);
+            let info = parse_info(json, &target)?;
+            store_info_json(&target, output.stdout);
+            return Ok(info);
         }
 
         last_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1563,7 +1614,7 @@ fn move_finished_to_save_dir(src: &Path, save_dir: &Path, preferred_name: &str) 
 /// Confirm yt-dlp's chosen format is close to the requested height before spending bandwidth.
 async fn assert_selected_height(
     ytdlp: &Path,
-    url: &str,
+    source: &[String],
     selector: &str,
     sort: Option<&str>,
     want_height: u32,
@@ -1578,7 +1629,7 @@ async fn assert_selected_height(
         .arg("--print")
         .arg("%(height)s")
         .arg("--skip-download")
-        .arg(url)
+        .args(source)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(s) = sort {
@@ -1654,6 +1705,9 @@ pub async fn download(
             Err(e) => return Err(anyhow::anyhow!("{e:#}")),
         }
     }
+    let target = resolve_youtube_target(url, opts.referer.as_deref())
+        .unwrap_or_else(|| url.to_string());
+    let mut used_cache = cached_info_json(&target).is_some();
     let mut last_err = String::new();
     for attempt in 1..=2u32 {
         match download_once(
@@ -1676,6 +1730,15 @@ pub async fn download(
             }
             Err(e) => {
                 last_err = e.to_string();
+                if attempt == 1 && used_cache {
+                    warn!(
+                        "yt-dlp failed with cached extraction — retrying with a fresh one: {}",
+                        truncate_for_log(&last_err, 240)
+                    );
+                    forget_info_json(&target);
+                    used_cache = false;
+                    continue;
+                }
                 let merge = is_merge_or_ffmpeg_error(&last_err);
                 if attempt == 1 && merge {
                     warn!(
@@ -1788,6 +1851,24 @@ async fn download_once(
         "{DM_PROG_PREFIX}%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s|%(progress._percent_str)s"
     );
 
+    // Reuse the probe's extraction instead of making yt-dlp re-extract the page (twice).
+    let source: Vec<String> = match (!is_hls).then(|| cached_info_json(&target)).flatten() {
+        Some(json) => {
+            let path = work_dir.join("info.json");
+            match std::fs::write(&path, json.as_slice()) {
+                Ok(()) => {
+                    info!("yt-dlp: using cached extraction ({} bytes)", json.len());
+                    vec!["--load-info-json".into(), path.to_string_lossy().into_owned()]
+                }
+                Err(e) => {
+                    warn!("could not write cached info JSON ({e}) — re-extracting");
+                    vec![target.clone()]
+                }
+            }
+        }
+        None => vec![target.clone()],
+    };
+
     let fragments = if is_hls {
         /* Native HLS fragment workers. 32 saturates a typical link without a second merge pass. */
         opts.concurrent_fragments.unwrap_or(32).clamp(8, 32)
@@ -1802,7 +1883,7 @@ async fn download_once(
         if let Some(want) = parse_quality_height(&normalized_quality(opts)) {
             if let Err(e) = assert_selected_height(
                 &ytdlp,
-                &target,
+                &source,
                 &selector,
                 format_sort(opts).as_deref(),
                 want,
@@ -1887,7 +1968,7 @@ async fn download_once(
         .arg("after_move:filepath")
         .arg("--print")
         .arg("after_move:filename")
-        .arg(&target)
+        .args(&source)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
