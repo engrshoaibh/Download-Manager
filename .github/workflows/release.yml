@@ -1,10 +1,18 @@
 name: Release
 
+# Releases are automatic: a push to main whose core/Cargo.toml version has no tag yet
+# builds the installer, creates the vX.Y.Z tag and publishes the GitHub Release.
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-release:
@@ -26,13 +34,23 @@ jobs:
           workspaces: core
 
       # The tag must match the crate version: the in-app updater compares them.
-      - name: Verify tag matches crate version
-        if: startsWith(github.ref, 'refs/tags/')
+      # On main / manual runs, release only when this version has not been released yet.
+      - name: Decide release
+        id: rel
         shell: pwsh
         run: |
           $crate = (Select-String -Path core/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $tag = "${{ github.ref_name }}".TrimStart('v')
-          if ($crate -ne $tag) { throw "Tag v$tag does not match core/Cargo.toml version $crate" }
+          $tag = "v$crate"
+          if ("${{ github.ref }}".StartsWith('refs/tags/')) {
+            if ("${{ github.ref_name }}" -ne $tag) { throw "Tag ${{ github.ref_name }} does not match core/Cargo.toml version $crate" }
+            $release = 'true'
+          } else {
+            $existing = git ls-remote --tags origin "refs/tags/$tag"
+            $release = if ($existing) { 'false' } else { 'true' }
+            if ($existing) { Write-Host "$tag already released - building without publishing" }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "release=$release" >> $env:GITHUB_OUTPUT
 
       - name: Run tests
         working-directory: core
@@ -52,18 +70,21 @@ jobs:
         run: .\build_release.ps1
 
       # Branch / manual runs: keep the assets as a run artifact (no release is created).
-      - name: Upload assets (non-tag runs)
-        if: "!startsWith(github.ref, 'refs/tags/')"
+      - name: Upload assets (no release)
+        if: steps.rel.outputs.release != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: installer
           path: release/*
           if-no-files-found: error
 
+      # Creates the tag on this commit when it doesn't exist yet.
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: steps.rel.outputs.release == 'true'
         with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: release/*
           generate_release_notes: true
         env:
