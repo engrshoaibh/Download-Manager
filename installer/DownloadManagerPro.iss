@@ -59,6 +59,9 @@ Source: "{#SourceDir}\core\target\release\dm-native-host.exe"; DestDir: "{app}";
 Source: "{#SourceDir}\installer\com.dmpro.native_host.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\extension\*"; DestDir: "{app}\browser-extension"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+; yt-dlp goes into the app's managed tools folder, which the in-app updater refreshes.
+; Keep an existing copy: it is at least as new as the bundled one.
+Source: "{#SourceDir}\installer\vendor\yt-dlp.exe"; DestDir: "{localappdata}\download-manager\bin"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"

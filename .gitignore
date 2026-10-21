@@ -41,3 +41,6 @@ extension/build/
 
 # Release build output
 release/
+
+# Third-party binaries fetched by build_release.ps1
+installer/vendor/

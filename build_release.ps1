@@ -35,6 +35,22 @@ foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
     if ($ascii -match '(?i)vcruntime140\.dll') { throw "$bin still depends on VCRUNTIME140.dll (crt-static not applied)" }
 }
 
+Write-Host 'Fetching yt-dlp for the installer...'
+# Shipped so YouTube works right after install; the app's updater keeps it current afterwards.
+$VendorDir = Join-Path $Root 'installer\vendor'
+New-Item -ItemType Directory -Path $VendorDir -Force | Out-Null
+$YtDlp = Join-Path $VendorDir 'yt-dlp.exe'
+$YtBase = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download'
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest -Uri "$YtBase/yt-dlp.exe" -OutFile $YtDlp -UseBasicParsing
+$sums = (Invoke-WebRequest -Uri "$YtBase/SHA2-256SUMS" -UseBasicParsing).Content
+if ($sums -is [byte[]]) { $sums = [System.Text.Encoding]::ASCII.GetString($sums) }
+$expected = ($sums -split "`n" | Where-Object { $_ -match '\syt-dlp\.exe\s*$' } | Select-Object -First 1) -replace '\s.*$', ''
+if (-not $expected) { throw 'yt-dlp.exe checksum not found in SHA2-256SUMS' }
+$actual = (Get-FileHash $YtDlp -Algorithm SHA256).Hash
+if ($actual -ne $expected.Trim().ToUpper()) { throw "yt-dlp.exe checksum mismatch (expected $expected, got $actual)" }
+Write-Host "yt-dlp.exe verified ($((Get-Item $YtDlp).Length) bytes)"
+
 Write-Host 'Locating Inno Setup...'
 $Iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
 if (-not $Iscc) {
