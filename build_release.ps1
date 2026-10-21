@@ -28,7 +28,11 @@ try {
 }
 
 foreach ($bin in 'dm-gui.exe', 'dm-daemon.exe', 'dm-native-host.exe') {
-    if (-not (Test-Path (Join-Path $Root "core\target\release\$bin"))) { throw "Missing build output: $bin" }
+    $binPath = Join-Path $Root "core\target\release\$bin"
+    if (-not (Test-Path $binPath)) { throw "Missing build output: $bin" }
+    # Fresh Windows installs lack the VC++ runtime; core/.cargo/config.toml links it statically.
+    $ascii = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($binPath))
+    if ($ascii -match '(?i)vcruntime140\.dll') { throw "$bin still depends on VCRUNTIME140.dll (crt-static not applied)" }
 }
 
 Write-Host 'Locating Inno Setup...'

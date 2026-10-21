@@ -1,0 +1,7 @@
+# Statically link the MSVC C runtime so the binaries don't need VCRUNTIME140.dll
+# (missing on fresh Windows installs without the VC++ Redistributable).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
